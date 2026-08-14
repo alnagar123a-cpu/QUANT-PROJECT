@@ -1,0 +1,164 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//@version=5
+
+// =============================================================================
+// Momentum ROC Signal [ES/NQ 1H]
+//
+// A momentum-based signal indicator built for ES/NQ index futures on the
+// 1-hour chart. Rate-of-change (ROC) momentum is smoothed with a moving
+// average, filtered by trend direction and volatility, and optionally
+// restricted to regular trading hours to reduce whipsaws in low-liquidity
+// overnight Globex sessions.
+//
+// NOTE ON PANE LAYOUT: the script itself is declared overlay=false so the
+// momentum oscillator gets its own separate pane below the price chart.
+// The buy/sell arrows, background regime shading and the optional trend
+// EMA are pushed onto the main price chart individually via the
+// force_overlay=true argument on each plotting call.
+//
+// NOTE ON REPAINTING: every calculation below (ROC, smoothing, ATR, trend
+// EMA) is derived purely from close/high/low/volume of the current and
+// prior bars -- no request.security() with lookahead, and no reference to
+// unconfirmed future data. Signal conditions are additionally gated with
+// barstate.isconfirmed so a long/short marker is only drawn once its bar
+// has actually closed, meaning a plotted signal never disappears or moves
+// after the fact.
+// =============================================================================
+indicator("Momentum ROC Signal [ES/NQ 1H]", shorttitle = "Mom ROC Signal", overlay = false, format = format.price)
+
+// -----------------------------------------------------------------------------
+// INPUTS
+// -----------------------------------------------------------------------------
+grpMom    = "Momentum (ROC)"
+grpTrend  = "Trend Filter"
+grpVol    = "Volatility Filter"
+grpSess   = "Session Filter"
+grpDisp   = "Display"
+
+rocLen        = input.int(14, "ROC Lookback Period", minval = 1, group = grpMom, tooltip = "Number of bars used to measure percentage price change (rate of change).")
+smoothType    = input.string("EMA", "Smoothing Type", options = ["SMA", "EMA"], group = grpMom)
+smoothLen     = input.int(9, "Smoothing Length", minval = 1, group = grpMom)
+momThreshold  = input.float(0.0, "Momentum Threshold (%)", minval = 0.0, step = 0.05, group = grpMom, tooltip = "Smoothed ROC must cross above +threshold (long) or below -threshold (short). Leave at 0 for a simple zero-line cross.")
+
+trendFilterOn = input.bool(true, "Enable Trend Filter", group = grpTrend)
+trendLen      = input.int(50, "Trend EMA Length", minval = 1, group = grpTrend)
+showTrendEMA  = input.bool(true, "Plot Trend EMA on Chart", group = grpTrend)
+
+volFilterOn   = input.bool(true, "Enable Volatility Filter", group = grpVol)
+atrLen        = input.int(14, "ATR Length", minval = 1, group = grpVol)
+atrBaseLen    = input.int(50, "ATR Baseline (Average) Length", minval = 1, group = grpVol, tooltip = "ATR is compared against its own moving average over this length to detect abnormally quiet conditions.")
+volMult       = input.float(0.80, "Volatility Threshold Multiplier", minval = 0.0, step = 0.05, group = grpVol, tooltip = "Signals are suppressed when current ATR falls below (multiplier x average ATR), i.e. abnormally low volatility / chop.")
+
+sessionFilterOn = input.bool(false, "Restrict Signals to Regular Trading Hours", group = grpSess)
+sessionWindow   = input.session("0930-1600", "RTH Session", group = grpSess)
+sessionTZ       = input.string("America/New_York", "Session Timezone", group = grpSess)
+
+showArrows    = input.bool(true, "Show Buy/Sell Arrows on Chart", group = grpDisp)
+showBgShade   = input.bool(true, "Show Background Regime Shading", group = grpDisp)
+histStyle     = input.string("Histogram", "Oscillator Plot Style", options = ["Histogram", "Line"], group = grpDisp)
+
+// -----------------------------------------------------------------------------
+// MOMENTUM CALCULATION -- Rate of Change smoothed by SMA/EMA
+// -----------------------------------------------------------------------------
+// ta.roc() returns 100 * (close - close[rocLen]) / close[rocLen], i.e. the
+// percentage price change over the lookback period. This is the primary
+// signal driver.
+rawRoc = ta.roc(close, rocLen)
+
+// Smooth the raw ROC to filter out single-bar noise/false signals.
+smoothedMom = smoothType == "EMA" ? ta.ema(rawRoc, smoothLen) : ta.sma(rawRoc, smoothLen)
+
+// Slope of the smoothed momentum line, used to require the crossover to be
+// accompanied by expanding (not just barely tagging) momentum.
+momRising  = smoothedMom > smoothedMom[1]
+momFalling = smoothedMom < smoothedMom[1]
+
+// -----------------------------------------------------------------------------
+// TREND FILTER -- price relative to a longer-term EMA
+// -----------------------------------------------------------------------------
+// Only allow long signals when price sits above the higher-timeframe trend
+// EMA, and short signals when price sits below it. This keeps momentum
+// signals aligned with the dominant trend and cuts down on whipsaws during
+// range-bound ES/NQ sessions.
+trendEMA  = ta.ema(close, trendLen)
+uptrend   = close > trendEMA
+downtrend = close < trendEMA
+
+trendOKLong  = not trendFilterOn or uptrend
+trendOKShort = not trendFilterOn or downtrend
+
+// -----------------------------------------------------------------------------
+// VOLATILITY FILTER -- ATR vs. its own baseline average
+// -----------------------------------------------------------------------------
+// Compares current ATR to a longer moving average of ATR. When current ATR
+// drops below (volMult x baseline ATR), the market is treated as abnormally
+// quiet/choppy (common during overnight/low-liquidity hours on index
+// futures) and signals are suppressed.
+atrVal      = ta.atr(atrLen)
+atrBaseline = ta.sma(atrVal, atrBaseLen)
+volOK       = not volFilterOn or atrVal >= volMult * atrBaseline
+
+// -----------------------------------------------------------------------------
+// SESSION FILTER -- optional restriction to regular trading hours
+// -----------------------------------------------------------------------------
+// time() returns a non-na timestamp only for bars whose bar-open falls
+// inside the specified session window/timezone, and na otherwise, giving a
+// clean boolean test with no repaint risk.
+inSessionWindow = not na(time(timeframe.period, sessionWindow, sessionTZ))
+sessionOK       = not sessionFilterOn or inSessionWindow
+
+// -----------------------------------------------------------------------------
+// SIGNAL LOGIC -- zero/threshold crossover + slope + trend + volatility + session
+// -----------------------------------------------------------------------------
+crossUpRaw   = ta.crossover(smoothedMom, momThreshold)
+crossDownRaw = ta.crossunder(smoothedMom, -momThreshold)
+
+longCondition  = crossUpRaw   and momRising  and trendOKLong  and volOK and sessionOK
+shortCondition = crossDownRaw and momFalling and trendOKShort and volOK and sessionOK
+
+// Gate with barstate.isconfirmed so a marker only prints once its bar has
+// actually closed -- this is what makes the signals non-repainting: a
+// signal that appears will never later vanish or shift to a different bar.
+longSignal  = longCondition  and barstate.isconfirmed
+shortSignal = shortCondition and barstate.isconfirmed
+
+// -----------------------------------------------------------------------------
+// PLOTS -- oscillator pane
+// -----------------------------------------------------------------------------
+// Color-code the oscillator by sign (bullish/bearish) and by slope
+// (strengthening vs. fading) for a quick visual read of momentum quality.
+momColor = smoothedMom >= 0
+     ? (momRising  ? color.new(color.lime,  0)  : color.new(color.green, 45))
+     : (momFalling ? color.new(color.red,   0)  : color.new(color.orange, 45))
+
+plot(histStyle == "Histogram" ? smoothedMom : na, title = "Momentum (Histogram)", style = plot.style_columns, color = momColor)
+plot(histStyle == "Line" ? smoothedMom : na, title = "Momentum (Line)", style = plot.style_line, color = momColor, linewidth = 2)
+
+hline(0, "Zero Line", color = color.gray, linestyle = hline.style_solid)
+plot(momThreshold  != 0 ? momThreshold  : na, title = "Long Threshold",  color = color.new(color.green, 60), style = plot.style_line)
+plot(momThreshold  != 0 ? -momThreshold : na, title = "Short Threshold", color = color.new(color.red,   60), style = plot.style_line)
+
+// Small markers in the oscillator pane at the exact bar of each confirmed signal.
+plotshape(longSignal,  title = "Long (oscillator pane)",  style = shape.triangleup,   location = location.bottom, color = color.lime, size = size.tiny)
+plotshape(shortSignal, title = "Short (oscillator pane)", style = shape.triangledown, location = location.top,    color = color.red,  size = size.tiny)
+
+// -----------------------------------------------------------------------------
+// PLOTS -- pushed onto the main price chart via force_overlay
+// -----------------------------------------------------------------------------
+plot(showTrendEMA ? trendEMA : na, title = "Trend EMA", color = color.new(color.blue, 20), linewidth = 2, force_overlay = true)
+
+plotshape(showArrows and longSignal,  title = "Buy Arrow",  style = shape.triangleup,   location = location.belowbar, color = color.new(color.lime, 0), size = size.small, text = "BUY",  textcolor = color.lime, force_overlay = true)
+plotshape(showArrows and shortSignal, title = "Sell Arrow", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0),  size = size.small, text = "SELL", textcolor = color.red,  force_overlay = true)
+
+// Confirmed momentum regime = trend direction agrees with momentum sign
+// (only meaningful to show once trend filter direction is established).
+bullRegime = uptrend   and smoothedMom > momThreshold
+bearRegime = downtrend and smoothedMom < -momThreshold
+regimeColor = showBgShade ? (bullRegime ? color.new(color.green, 90) : bearRegime ? color.new(color.red, 90) : na) : na
+bgcolor(regimeColor, title = "Momentum Regime Shading", force_overlay = true)
+
+// -----------------------------------------------------------------------------
+// ALERTS
+// -----------------------------------------------------------------------------
+alertcondition(longSignal,  title = "Momentum Long Signal",  message = "Momentum ROC Long signal on {{ticker}} {{interval}} at {{close}}")
+alertcondition(shortSignal, title = "Momentum Short Signal", message = "Momentum ROC Short signal on {{ticker}} {{interval}} at {{close}}")
