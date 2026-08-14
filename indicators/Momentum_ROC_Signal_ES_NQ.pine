@@ -60,6 +60,7 @@ sessionTZ       = input.string("America/New_York", "Session Timezone", group = g
 showRiskLevels = input.bool(true, "Show Entry / Stop Loss / Take Profit Levels", group = grpRisk)
 stopAtrMult    = input.float(1.5, "Stop Loss (ATR Multiple)", minval = 0.1, step = 0.1, group = grpRisk, tooltip = "Stop loss is placed this many ATRs away from the entry price, on the opposite side of the trade.")
 rewardMult     = input.float(2.0, "Take Profit (Risk:Reward Multiple)", minval = 0.1, step = 0.1, group = grpRisk, tooltip = "Take-profit target is placed at (risk distance x this multiple) beyond the entry price, i.e. where to exit/sell the position.")
+orderQty       = input.int(1, "Order Quantity (Contracts)", minval = 1, group = grpRisk, tooltip = "Number of contracts sent in the webhook JSON payload for automated execution (e.g. via TradersPost).")
 
 showArrows    = input.bool(true, "Show Long/Short Arrows on Chart", group = grpDisp)
 showBgShade   = input.bool(true, "Show Background Regime Shading", group = grpDisp)
@@ -253,14 +254,22 @@ bgcolor(regimeColor, title = "Momentum Regime Shading", force_overlay = true)
 // ALERTS
 // -----------------------------------------------------------------------------
 // alertcondition() entries let TradingView's "Create Alert" dialog target
-// this indicator directly. alert() calls below additionally fire a dynamic
-// message that includes the actual entry, stop loss and take-profit prices
-// for that signal, once per confirmed bar close (no repaint).
+// this indicator directly for manual/notification-only alerts.
+//
+// The alert() calls below fire a JSON payload shaped for TradersPost's
+// webhook format (ticker/action/quantity/type + a bracket order carrying
+// the same stop-loss and take-profit levels plotted on the chart), so a
+// single TradingView alert set to "Any alert() function call" + webhook URL
+// can drive automated entries with the stop/target attached as a broker-side
+// bracket order. {{ticker}} is substituted by TradingView at alert time.
+// Fired once per confirmed bar close, matching the non-repainting signals.
 alertcondition(longSignal,  title = "Momentum Long Signal",  message = "Momentum ROC Long signal on {{ticker}} {{interval}} at {{close}}")
 alertcondition(shortSignal, title = "Momentum Short Signal", message = "Momentum ROC Short signal on {{ticker}} {{interval}} at {{close}}")
 
 if longSignal
-    alert("Momentum ROC LONG " + syminfo.ticker + " " + timeframe.period + " | Entry " + str.tostring(entryPrice, format.mintick) + " | Stop " + str.tostring(stopLossPrice, format.mintick) + " | Target(sell) " + str.tostring(takeProfitPrice, format.mintick), alert.freq_once_per_bar_close)
+    longWebhookMsg = '{"ticker":"{{ticker}}","action":"buy","quantity":' + str.tostring(orderQty) + ',"type":"market","bracket":{"takeProfit":{"limitPrice":' + str.tostring(takeProfitPrice, format.mintick) + '},"stopLoss":{"stopPrice":' + str.tostring(stopLossPrice, format.mintick) + '}}}'
+    alert(longWebhookMsg, alert.freq_once_per_bar_close)
 
 if shortSignal
-    alert("Momentum ROC SHORT " + syminfo.ticker + " " + timeframe.period + " | Entry " + str.tostring(entryPrice, format.mintick) + " | Stop " + str.tostring(stopLossPrice, format.mintick) + " | Target(cover) " + str.tostring(takeProfitPrice, format.mintick), alert.freq_once_per_bar_close)
+    shortWebhookMsg = '{"ticker":"{{ticker}}","action":"sell","quantity":' + str.tostring(orderQty) + ',"type":"market","bracket":{"takeProfit":{"limitPrice":' + str.tostring(takeProfitPrice, format.mintick) + '},"stopLoss":{"stopPrice":' + str.tostring(stopLossPrice, format.mintick) + '}}}'
+    alert(shortWebhookMsg, alert.freq_once_per_bar_close)
