@@ -137,33 +137,74 @@ shortSignal = shortCondition and barstate.isconfirmed
 // invalidates the trade. Take profit (the price to sell/cover at) is placed
 // at rewardMult times that risk distance beyond the entry. Levels are fixed
 // at the moment a signal fires (using that bar's already-confirmed ATR) and
-// held until price trades through either level or the opposite signal fires
-// -- this is a visualization of a single hypothetical trade, not an
+// held until price trades through either level or a new signal replaces the
+// trade -- this is a visualization of a single hypothetical trade, not an
 // execution engine.
 var float entryPrice      = na
 var float stopLossPrice   = na
 var float takeProfitPrice = na
 var int   posDir          = 0   // 1 = long open, -1 = short open, 0 = flat
 
+// On-chart drawings belonging to the currently displayed trade. They are
+// kept as var references so they can be explicitly deleted: once a trade is
+// invalidated (stop or target hit) or replaced by a new signal, its arrow
+// and SL/TP labels are removed instead of being left on the chart.
+var label arrowLbl = na
+var label slLbl    = na
+var label tpLbl    = na
+
+// A fresh signal always replaces whatever trade/drawings are on screen.
+// label.delete() is a safe no-op when the id is na, so this also covers the
+// very first signal on the chart, where nothing has been drawn yet.
+if longSignal or shortSignal
+    label.delete(arrowLbl)
+    label.delete(slLbl)
+    label.delete(tpLbl)
+    arrowLbl := na
+    slLbl    := na
+    tpLbl    := na
+
 if longSignal
     entryPrice      := close
     stopLossPrice   := close - atrVal * stopAtrMult
     takeProfitPrice := close + (close - stopLossPrice) * rewardMult
     posDir          := 1
+    if showArrows
+        arrowLbl := label.new(bar_index, na, text = "LONG @ " + str.tostring(entryPrice, format.mintick), style = label.style_triangleup, yloc = yloc.belowbar, color = color.new(color.lime, 0), textcolor = color.black, size = size.small, force_overlay = true)
+    if showRiskLevels
+        slLbl := label.new(bar_index, stopLossPrice,   text = "SL " + str.tostring(stopLossPrice, format.mintick),   style = label.style_label_left, color = color.new(color.red, 20),   textcolor = color.white, size = size.tiny, force_overlay = true)
+        tpLbl := label.new(bar_index, takeProfitPrice, text = "TP " + str.tostring(takeProfitPrice, format.mintick), style = label.style_label_left, color = color.new(color.green, 20), textcolor = color.white, size = size.tiny, force_overlay = true)
 
 if shortSignal
     entryPrice      := close
     stopLossPrice   := close + atrVal * stopAtrMult
     takeProfitPrice := close - (stopLossPrice - close) * rewardMult
     posDir          := -1
+    if showArrows
+        arrowLbl := label.new(bar_index, na, text = "SHORT @ " + str.tostring(entryPrice, format.mintick), style = label.style_triangledown, yloc = yloc.abovebar, color = color.new(color.red, 0), textcolor = color.white, size = size.small, force_overlay = true)
+    if showRiskLevels
+        slLbl := label.new(bar_index, stopLossPrice,   text = "SL " + str.tostring(stopLossPrice, format.mintick),   style = label.style_label_left, color = color.new(color.red, 20),   textcolor = color.white, size = size.tiny, force_overlay = true)
+        tpLbl := label.new(bar_index, takeProfitPrice, text = "TP " + str.tostring(takeProfitPrice, format.mintick), style = label.style_label_left, color = color.new(color.green, 20), textcolor = color.white, size = size.tiny, force_overlay = true)
 
-// Clear the tracked levels once confirmed price action trades through the
-// stop or the target, so the plotted lines stop at the bar where the trade
-// would have closed.
+// Once confirmed price action trades through the stop or the target, the
+// trade is invalid: clear its tracked state and remove its arrow/SL/TP
+// labels from the chart -- this is the "invalidated trade" cleanup.
 if posDir == 1 and (low <= stopLossPrice or high >= takeProfitPrice)
     posDir := 0
+    label.delete(arrowLbl)
+    label.delete(slLbl)
+    label.delete(tpLbl)
+    arrowLbl := na
+    slLbl    := na
+    tpLbl    := na
 if posDir == -1 and (high >= stopLossPrice or low <= takeProfitPrice)
     posDir := 0
+    label.delete(arrowLbl)
+    label.delete(slLbl)
+    label.delete(tpLbl)
+    arrowLbl := na
+    slLbl    := na
+    tpLbl    := na
 
 // -----------------------------------------------------------------------------
 // PLOTS -- oscillator pane
@@ -190,28 +231,16 @@ plotshape(shortSignal, title = "Short (oscillator pane)", style = shape.triangle
 // -----------------------------------------------------------------------------
 plot(showTrendEMA ? trendEMA : na, title = "Trend EMA", color = color.new(color.blue, 20), linewidth = 2, force_overlay = true)
 
-plotshape(showArrows and longSignal,  title = "Long Arrow",  style = shape.triangleup,   location = location.belowbar, color = color.new(color.lime, 0), size = size.small, text = "LONG",  textcolor = color.lime, force_overlay = true)
-plotshape(showArrows and shortSignal, title = "Short Arrow", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0),  size = size.small, text = "SHORT", textcolor = color.red,  force_overlay = true)
-
-// Step-lines showing exactly where to place the stop loss and where to
-// place the take-profit/sell order for the currently tracked trade. They
-// break (via style_linebr) whenever there is no open trade or a new one
-// starts, so each trade gets its own clearly bounded pair of levels.
+// The long/short arrow and its entry price, plus the SL/TP labels, are
+// drawn up in the RISK LEVELS block above (where they're created as
+// deletable label objects) so they can be removed the instant a trade is
+// invalidated. Only the continuous step-lines for the SL/TP levels live
+// here, since plot() series naturally stop drawing once posDir returns to
+// flat -- they break (via style_linebr) whenever there is no open trade or
+// a new one starts, so each trade gets its own clearly bounded pair of
+// levels.
 plot(showRiskLevels and posDir != 0 ? stopLossPrice   : na, title = "Stop Loss",   color = color.new(color.red,   0), style = plot.style_linebr, linewidth = 1, force_overlay = true)
 plot(showRiskLevels and posDir != 0 ? takeProfitPrice : na, title = "Take Profit", color = color.new(color.green, 0), style = plot.style_linebr, linewidth = 1, force_overlay = true)
-
-// Numeric labels pinned to the entry, stop and target prices at the moment
-// each trade opens -- entryPrice is the exact price to enter the long/short
-// at (the confirmed close of the signal bar).
-if showRiskLevels and longSignal
-    label.new(bar_index, entryPrice,      text = "LONG @ " + str.tostring(entryPrice, format.mintick),  style = label.style_label_right, color = color.new(color.blue, 20),  textcolor = color.white, size = size.small, force_overlay = true)
-    label.new(bar_index, stopLossPrice,   text = "SL " + str.tostring(stopLossPrice, format.mintick),   style = label.style_label_left, color = color.new(color.red, 20),   textcolor = color.white, size = size.tiny, force_overlay = true)
-    label.new(bar_index, takeProfitPrice, text = "TP " + str.tostring(takeProfitPrice, format.mintick), style = label.style_label_left, color = color.new(color.green, 20), textcolor = color.white, size = size.tiny, force_overlay = true)
-
-if showRiskLevels and shortSignal
-    label.new(bar_index, entryPrice,      text = "SHORT @ " + str.tostring(entryPrice, format.mintick), style = label.style_label_right, color = color.new(color.blue, 20),  textcolor = color.white, size = size.small, force_overlay = true)
-    label.new(bar_index, stopLossPrice,   text = "SL " + str.tostring(stopLossPrice, format.mintick),   style = label.style_label_left, color = color.new(color.red, 20),   textcolor = color.white, size = size.tiny, force_overlay = true)
-    label.new(bar_index, takeProfitPrice, text = "TP " + str.tostring(takeProfitPrice, format.mintick), style = label.style_label_left, color = color.new(color.green, 20), textcolor = color.white, size = size.tiny, force_overlay = true)
 
 // Confirmed momentum regime = trend direction agrees with momentum sign
 // (only meaningful to show once trend filter direction is established).
