@@ -2,13 +2,16 @@
 //@version=5
 
 // =============================================================================
-// Momentum ROC Signal [ES/NQ 1H]
+// Momentum ROC Signal [ES/NQ 5m]
 //
 // A momentum-based signal indicator built for ES/NQ index futures on the
-// 1-hour chart. Rate-of-change (ROC) momentum is smoothed with a moving
+// 5-minute chart. Rate-of-change (ROC) momentum is smoothed with a moving
 // average, filtered by trend direction and volatility, and optionally
 // restricted to regular trading hours to reduce whipsaws in low-liquidity
-// overnight Globex sessions.
+// overnight Globex sessions. Default lengths are tuned for the faster,
+// noisier bar-to-bar behavior of a 5-minute chart versus a 1-hour chart
+// (shorter ROC/smoothing to stay responsive, a longer trend EMA so "trend"
+// still reflects the broader session rather than a few minutes of chop).
 //
 // NOTE ON PANE LAYOUT: the script itself is declared overlay=false so the
 // momentum oscillator gets its own separate pane below the price chart.
@@ -24,7 +27,7 @@
 // has actually closed, meaning a plotted signal never disappears or moves
 // after the fact.
 // =============================================================================
-indicator("Momentum ROC Signal [ES/NQ 1H]", shorttitle = "Mom ROC Signal", overlay = false, format = format.price)
+indicator("Momentum ROC Signal [ES/NQ 5m]", shorttitle = "Mom ROC Signal", overlay = false, format = format.price)
 
 // -----------------------------------------------------------------------------
 // INPUTS
@@ -36,18 +39,18 @@ grpSess   = "Session Filter"
 grpRisk   = "Risk Levels"
 grpDisp   = "Display"
 
-rocLen        = input.int(14, "ROC Lookback Period", minval = 1, group = grpMom, tooltip = "Number of bars used to measure percentage price change (rate of change).")
+rocLen        = input.int(10, "ROC Lookback Period", minval = 1, group = grpMom, tooltip = "Number of bars used to measure percentage price change (rate of change). 10 bars = 50 minutes on a 5m chart.")
 smoothType    = input.string("EMA", "Smoothing Type", options = ["SMA", "EMA"], group = grpMom)
-smoothLen     = input.int(9, "Smoothing Length", minval = 1, group = grpMom)
+smoothLen     = input.int(5, "Smoothing Length", minval = 1, group = grpMom)
 momThreshold  = input.float(0.0, "Momentum Threshold (%)", minval = 0.0, step = 0.05, group = grpMom, tooltip = "Smoothed ROC must cross above +threshold (long) or below -threshold (short). Leave at 0 for a simple zero-line cross.")
 
 trendFilterOn = input.bool(true, "Enable Trend Filter", group = grpTrend)
-trendLen      = input.int(50, "Trend EMA Length", minval = 1, group = grpTrend)
+trendLen      = input.int(200, "Trend EMA Length", minval = 1, group = grpTrend, tooltip = "200 bars = ~16.7 hours on a 5m chart, i.e. roughly the prior full session -- keeps the trend read from being dominated by a few minutes of noise.")
 showTrendEMA  = input.bool(true, "Plot Trend EMA on Chart", group = grpTrend)
 
 volFilterOn   = input.bool(true, "Enable Volatility Filter", group = grpVol)
 atrLen        = input.int(14, "ATR Length", minval = 1, group = grpVol)
-atrBaseLen    = input.int(50, "ATR Baseline (Average) Length", minval = 1, group = grpVol, tooltip = "ATR is compared against its own moving average over this length to detect abnormally quiet conditions.")
+atrBaseLen    = input.int(100, "ATR Baseline (Average) Length", minval = 1, group = grpVol, tooltip = "ATR is compared against its own moving average over this length to detect abnormally quiet conditions. 100 bars = ~8.3 hours on a 5m chart.")
 volMult       = input.float(0.80, "Volatility Threshold Multiplier", minval = 0.0, step = 0.05, group = grpVol, tooltip = "Signals are suppressed when current ATR falls below (multiplier x average ATR), i.e. abnormally low volatility / chop.")
 
 sessionFilterOn = input.bool(false, "Restrict Signals to Regular Trading Hours", group = grpSess)
