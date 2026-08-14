@@ -12,9 +12,9 @@
 //
 // NOTE ON PANE LAYOUT: the script itself is declared overlay=false so the
 // momentum oscillator gets its own separate pane below the price chart.
-// The buy/sell arrows, background regime shading and the optional trend
-// EMA are pushed onto the main price chart individually via the
-// force_overlay=true argument on each plotting call.
+// The long/short arrows, stop-loss/take-profit levels, background regime
+// shading and the optional trend EMA are pushed onto the main price chart
+// individually via the force_overlay=true argument on each plotting call.
 //
 // NOTE ON REPAINTING: every calculation below (ROC, smoothing, ATR, trend
 // EMA) is derived purely from close/high/low/volume of the current and
@@ -33,6 +33,7 @@ grpMom    = "Momentum (ROC)"
 grpTrend  = "Trend Filter"
 grpVol    = "Volatility Filter"
 grpSess   = "Session Filter"
+grpRisk   = "Risk Levels"
 grpDisp   = "Display"
 
 rocLen        = input.int(14, "ROC Lookback Period", minval = 1, group = grpMom, tooltip = "Number of bars used to measure percentage price change (rate of change).")
@@ -53,7 +54,11 @@ sessionFilterOn = input.bool(false, "Restrict Signals to Regular Trading Hours",
 sessionWindow   = input.session("0930-1600", "RTH Session", group = grpSess)
 sessionTZ       = input.string("America/New_York", "Session Timezone", group = grpSess)
 
-showArrows    = input.bool(true, "Show Buy/Sell Arrows on Chart", group = grpDisp)
+showRiskLevels = input.bool(true, "Show Stop Loss / Take Profit Levels", group = grpRisk)
+stopAtrMult    = input.float(1.5, "Stop Loss (ATR Multiple)", minval = 0.1, step = 0.1, group = grpRisk, tooltip = "Stop loss is placed this many ATRs away from the entry price, on the opposite side of the trade.")
+rewardMult     = input.float(2.0, "Take Profit (Risk:Reward Multiple)", minval = 0.1, step = 0.1, group = grpRisk, tooltip = "Take-profit target is placed at (risk distance x this multiple) beyond the entry price, i.e. where to exit/sell the position.")
+
+showArrows    = input.bool(true, "Show Long/Short Arrows on Chart", group = grpDisp)
 showBgShade   = input.bool(true, "Show Background Regime Shading", group = grpDisp)
 histStyle     = input.string("Histogram", "Oscillator Plot Style", options = ["Histogram", "Line"], group = grpDisp)
 
@@ -123,6 +128,41 @@ longSignal  = longCondition  and barstate.isconfirmed
 shortSignal = shortCondition and barstate.isconfirmed
 
 // -----------------------------------------------------------------------------
+// RISK LEVELS -- ATR-based stop loss and take-profit (exit) for each signal
+// -----------------------------------------------------------------------------
+// Stop loss is placed stopAtrMult ATRs beyond the entry, on the side that
+// invalidates the trade. Take profit (the price to sell/cover at) is placed
+// at rewardMult times that risk distance beyond the entry. Levels are fixed
+// at the moment a signal fires (using that bar's already-confirmed ATR) and
+// held until price trades through either level or the opposite signal fires
+// -- this is a visualization of a single hypothetical trade, not an
+// execution engine.
+var float entryPrice      = na
+var float stopLossPrice   = na
+var float takeProfitPrice = na
+var int   posDir          = 0   // 1 = long open, -1 = short open, 0 = flat
+
+if longSignal
+    entryPrice      := close
+    stopLossPrice   := close - atrVal * stopAtrMult
+    takeProfitPrice := close + (close - stopLossPrice) * rewardMult
+    posDir          := 1
+
+if shortSignal
+    entryPrice      := close
+    stopLossPrice   := close + atrVal * stopAtrMult
+    takeProfitPrice := close - (stopLossPrice - close) * rewardMult
+    posDir          := -1
+
+// Clear the tracked levels once confirmed price action trades through the
+// stop or the target, so the plotted lines stop at the bar where the trade
+// would have closed.
+if posDir == 1 and (low <= stopLossPrice or high >= takeProfitPrice)
+    posDir := 0
+if posDir == -1 and (high >= stopLossPrice or low <= takeProfitPrice)
+    posDir := 0
+
+// -----------------------------------------------------------------------------
 // PLOTS -- oscillator pane
 // -----------------------------------------------------------------------------
 // Color-code the oscillator by sign (bullish/bearish) and by slope
@@ -147,8 +187,24 @@ plotshape(shortSignal, title = "Short (oscillator pane)", style = shape.triangle
 // -----------------------------------------------------------------------------
 plot(showTrendEMA ? trendEMA : na, title = "Trend EMA", color = color.new(color.blue, 20), linewidth = 2, force_overlay = true)
 
-plotshape(showArrows and longSignal,  title = "Buy Arrow",  style = shape.triangleup,   location = location.belowbar, color = color.new(color.lime, 0), size = size.small, text = "BUY",  textcolor = color.lime, force_overlay = true)
-plotshape(showArrows and shortSignal, title = "Sell Arrow", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0),  size = size.small, text = "SELL", textcolor = color.red,  force_overlay = true)
+plotshape(showArrows and longSignal,  title = "Long Arrow",  style = shape.triangleup,   location = location.belowbar, color = color.new(color.lime, 0), size = size.small, text = "LONG",  textcolor = color.lime, force_overlay = true)
+plotshape(showArrows and shortSignal, title = "Short Arrow", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0),  size = size.small, text = "SHORT", textcolor = color.red,  force_overlay = true)
+
+// Step-lines showing exactly where to place the stop loss and where to
+// place the take-profit/sell order for the currently tracked trade. They
+// break (via style_linebr) whenever there is no open trade or a new one
+// starts, so each trade gets its own clearly bounded pair of levels.
+plot(showRiskLevels and posDir != 0 ? stopLossPrice   : na, title = "Stop Loss",   color = color.new(color.red,   0), style = plot.style_linebr, linewidth = 1, force_overlay = true)
+plot(showRiskLevels and posDir != 0 ? takeProfitPrice : na, title = "Take Profit", color = color.new(color.green, 0), style = plot.style_linebr, linewidth = 1, force_overlay = true)
+
+// Numeric labels pinned to the stop/target price at the moment each trade opens.
+if showRiskLevels and longSignal
+    label.new(bar_index, stopLossPrice,   text = "SL " + str.tostring(stopLossPrice, format.mintick),   style = label.style_label_left, color = color.new(color.red, 20),   textcolor = color.white, size = size.tiny, force_overlay = true)
+    label.new(bar_index, takeProfitPrice, text = "TP " + str.tostring(takeProfitPrice, format.mintick), style = label.style_label_left, color = color.new(color.green, 20), textcolor = color.white, size = size.tiny, force_overlay = true)
+
+if showRiskLevels and shortSignal
+    label.new(bar_index, stopLossPrice,   text = "SL " + str.tostring(stopLossPrice, format.mintick),   style = label.style_label_left, color = color.new(color.red, 20),   textcolor = color.white, size = size.tiny, force_overlay = true)
+    label.new(bar_index, takeProfitPrice, text = "TP " + str.tostring(takeProfitPrice, format.mintick), style = label.style_label_left, color = color.new(color.green, 20), textcolor = color.white, size = size.tiny, force_overlay = true)
 
 // Confirmed momentum regime = trend direction agrees with momentum sign
 // (only meaningful to show once trend filter direction is established).
@@ -160,5 +216,15 @@ bgcolor(regimeColor, title = "Momentum Regime Shading", force_overlay = true)
 // -----------------------------------------------------------------------------
 // ALERTS
 // -----------------------------------------------------------------------------
+// alertcondition() entries let TradingView's "Create Alert" dialog target
+// this indicator directly. alert() calls below additionally fire a dynamic
+// message that includes the actual entry, stop loss and take-profit prices
+// for that signal, once per confirmed bar close (no repaint).
 alertcondition(longSignal,  title = "Momentum Long Signal",  message = "Momentum ROC Long signal on {{ticker}} {{interval}} at {{close}}")
 alertcondition(shortSignal, title = "Momentum Short Signal", message = "Momentum ROC Short signal on {{ticker}} {{interval}} at {{close}}")
+
+if longSignal
+    alert("Momentum ROC LONG " + syminfo.ticker + " " + timeframe.period + " | Entry " + str.tostring(entryPrice, format.mintick) + " | Stop " + str.tostring(stopLossPrice, format.mintick) + " | Target(sell) " + str.tostring(takeProfitPrice, format.mintick), alert.freq_once_per_bar_close)
+
+if shortSignal
+    alert("Momentum ROC SHORT " + syminfo.ticker + " " + timeframe.period + " | Entry " + str.tostring(entryPrice, format.mintick) + " | Stop " + str.tostring(stopLossPrice, format.mintick) + " | Target(cover) " + str.tostring(takeProfitPrice, format.mintick), alert.freq_once_per_bar_close)
