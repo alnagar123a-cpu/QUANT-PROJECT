@@ -57,7 +57,7 @@ sessionFilterOn = input.bool(false, "Restrict Signals to Regular Trading Hours",
 sessionWindow   = input.session("0930-1600", "RTH Session", group = grpSess)
 sessionTZ       = input.string("America/New_York", "Session Timezone", group = grpSess)
 
-showRiskLevels = input.bool(true, "Show Stop Loss / Take Profit Levels", group = grpRisk)
+showRiskLevels = input.bool(true, "Show Entry / Stop Loss / Take Profit Levels", group = grpRisk)
 stopAtrMult    = input.float(1.5, "Stop Loss (ATR Multiple)", minval = 0.1, step = 0.1, group = grpRisk, tooltip = "Stop loss is placed this many ATRs away from the entry price, on the opposite side of the trade.")
 rewardMult     = input.float(2.0, "Take Profit (Risk:Reward Multiple)", minval = 0.1, step = 0.1, group = grpRisk, tooltip = "Take-profit target is placed at (risk distance x this multiple) beyond the entry price, i.e. where to exit/sell the position.")
 
@@ -200,12 +200,16 @@ plotshape(showArrows and shortSignal, title = "Short Arrow", style = shape.trian
 plot(showRiskLevels and posDir != 0 ? stopLossPrice   : na, title = "Stop Loss",   color = color.new(color.red,   0), style = plot.style_linebr, linewidth = 1, force_overlay = true)
 plot(showRiskLevels and posDir != 0 ? takeProfitPrice : na, title = "Take Profit", color = color.new(color.green, 0), style = plot.style_linebr, linewidth = 1, force_overlay = true)
 
-// Numeric labels pinned to the stop/target price at the moment each trade opens.
+// Numeric labels pinned to the entry, stop and target prices at the moment
+// each trade opens -- entryPrice is the exact price to enter the long/short
+// at (the confirmed close of the signal bar).
 if showRiskLevels and longSignal
+    label.new(bar_index, entryPrice,      text = "LONG @ " + str.tostring(entryPrice, format.mintick),  style = label.style_label_right, color = color.new(color.blue, 20),  textcolor = color.white, size = size.small, force_overlay = true)
     label.new(bar_index, stopLossPrice,   text = "SL " + str.tostring(stopLossPrice, format.mintick),   style = label.style_label_left, color = color.new(color.red, 20),   textcolor = color.white, size = size.tiny, force_overlay = true)
     label.new(bar_index, takeProfitPrice, text = "TP " + str.tostring(takeProfitPrice, format.mintick), style = label.style_label_left, color = color.new(color.green, 20), textcolor = color.white, size = size.tiny, force_overlay = true)
 
 if showRiskLevels and shortSignal
+    label.new(bar_index, entryPrice,      text = "SHORT @ " + str.tostring(entryPrice, format.mintick), style = label.style_label_right, color = color.new(color.blue, 20),  textcolor = color.white, size = size.small, force_overlay = true)
     label.new(bar_index, stopLossPrice,   text = "SL " + str.tostring(stopLossPrice, format.mintick),   style = label.style_label_left, color = color.new(color.red, 20),   textcolor = color.white, size = size.tiny, force_overlay = true)
     label.new(bar_index, takeProfitPrice, text = "TP " + str.tostring(takeProfitPrice, format.mintick), style = label.style_label_left, color = color.new(color.green, 20), textcolor = color.white, size = size.tiny, force_overlay = true)
 
