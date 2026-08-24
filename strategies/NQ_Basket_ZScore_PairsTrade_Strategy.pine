@@ -64,6 +64,17 @@
 // bar from today's beta/spread stats, so they will visibly drift over a
 // trade's life -- display only, the real orders are still driven by the
 // confirmed z-score crossing the exit/stop band, never by price itself.
+//
+// PROP FIRM RISK MANAGEMENT: position size (qty, in NQ or MNQ contracts)
+// is computed per trade from the live implied stop distance, capped so a
+// single entry risks no more than Risk Per Trade % of Max Account Loss --
+// default_qty_value below is just a fallback; every strategy.entry() call
+// overrides it with this computed qty. strategy.risk.max_drawdown() is
+// also armed as a native backstop: once equity draws down by Max Account
+// Loss from its peak, Pine force-flattens and blocks further orders for
+// the rest of the run. This backtests the RULE, not a live guarantee --
+// it cannot talk to your prop firm's platform, and gap risk can still
+// realize a larger loss than a single trade was sized for.
 // =============================================================================
 strategy("NQ / Basket Z-Score Pairs Strategy [NQ leg]", shorttitle = "NQ/Basket Z Strat", overlay = false, initial_capital = 100000, currency = currency.USD, default_qty_type = strategy.fixed, default_qty_value = 1, commission_type = strategy.commission.cash_per_contract, commission_value = 2.0, slippage = 2, process_orders_on_close = true, calc_on_every_tick = false)
 
@@ -74,6 +85,7 @@ strategy("NQ / Basket Z-Score Pairs Strategy [NQ leg]", shorttitle = "NQ/Basket 
 grpPartner = "Partner Instrument"
 grpBasket  = "Basket Constituents (used only when Partner = Equal-Weight Basket)"
 grpStrat   = "Strategy Parameters (tuned on NQ1! Daily -- see header)"
+grpRisk    = "Prop Firm Risk Management"
 grpSeg     = "Backtest Segment (Train -> Validate -> Test)"
 grpDisplay = "Display"
 
@@ -95,6 +107,28 @@ lookbackZ   = input.int(90, "Z-Score Lookback (bars)", minval = 5, group = grpSt
 entryZ      = input.float(2.0, "Entry Threshold |z|", minval = 0.1, step = 0.1, group = grpStrat)
 exitZ       = input.float(0.5, "Exit-to-Flat Threshold |z|", minval = 0.0, step = 0.1, group = grpStrat)
 stopZ       = input.float(3.5, "Hard Stop Threshold |z|", minval = 0.1, step = 0.1, group = grpStrat)
+
+// See the companion indicator's identical block for the full rationale.
+maxLossUSD      = input.float(2000, "Max Account Loss ($)", minval = 1, group = grpRisk, tooltip = "Hard ceiling on drawdown from the equity peak (e.g. a prop firm's max loss / trailing drawdown rule). Armed below via strategy.risk.max_drawdown() as a native backstop.")
+riskPerTradePct = input.float(10, "Risk Per Trade (% of Max Loss)", minval = 1, maxval = 100, step = 1, group = grpRisk, tooltip = "Caps a single trade's stop-loss risk at this fraction of Max Account Loss -- deliberately conservative, since this pair lost money net of costs even in its best backtest segment.")
+
+// IMPORTANT: unlike the companion indicator (which only displays its own
+// estimate and has no "Contract Type" dropdown to get out of sync), this
+// strategy's qty is settled by Pine using the CHART'S OWN symbol point
+// value -- a dropdown here would silently mis-size every trade if it
+// didn't match what the chart is actually running on. syminfo.pointvalue
+// is the $ per 1.0 index point for whatever symbol this script is loaded
+// on, so it always matches what Pine will actually realize. To size in
+// MNQ (micro, $2/pt) terms instead of full NQ ($20/pt), load this script
+// on the MNQ1! chart rather than NQ1! -- position sizing below adapts
+// automatically either way.
+pointValue = syminfo.pointvalue
+
+// Native Pine risk rule: once equity drops maxLossUSD from its peak, Pine
+// force-closes the open position and rejects further orders for the rest
+// of the run -- the backtest-level backstop behind the position sizing
+// below (see PROP FIRM RISK MANAGEMENT in the header).
+strategy.risk.max_drawdown(maxLossUSD, strategy.cash)
 
 // Which of the three windows below is actually traded. Flip this and re-run
 // to compare segments, matching the original backtest's methodology.
@@ -234,39 +268,69 @@ var label slLbl        = na
 var float entryPriceNQ  = na
 var label entryPriceLbl = na
 
+// Position-sizing / loss-governor state -- see the companion indicator's
+// identical comment. cumPnlUSD/killSwitch here are INFORMATIONAL (for the
+// table and a matching on-chart warning); the real enforcement is
+// strategy.risk.max_drawdown(), already armed above.
+var float slPriceAtEntry = na
+var int   tradeContracts = 0
+var float cumPnlUSD      = 0.0
+var bool  killSwitch     = false
+
 haveSignal = not na(zSig)
 
-longEntrySig  = haveSignal and inSegment and posState == 0 and zSig < -entryZ
-shortEntrySig = haveSignal and inSegment and posState == 0 and zSig >  entryZ
+// Prospective stop distance / position size for EACH possible direction,
+// evaluated every bar with live data -- BEFORE any entry decision -- so a
+// trade whose stop is too wide to size even 1 contract within the
+// per-trade risk budget is skipped entirely rather than forced through.
+riskBudgetUSD = maxLossUSD * riskPerTradePct / 100
+
+prospSlLong  = f_impliedNQPrice(-stopZ)
+prospSlShort = f_impliedNQPrice(stopZ)
+prospDistLong  = na(prospSlLong)  ? na : math.abs(close - prospSlLong)
+prospDistShort = na(prospSlShort) ? na : math.abs(close - prospSlShort)
+prospContractsLong  = (not na(prospDistLong)  and prospDistLong  > 0) ? math.floor(riskBudgetUSD / (prospDistLong  * pointValue)) : 0
+prospContractsShort = (not na(prospDistShort) and prospDistShort > 0) ? math.floor(riskBudgetUSD / (prospDistShort * pointValue)) : 0
+
+longEntrySig  = haveSignal and inSegment and not killSwitch and posState == 0 and zSig < -entryZ and prospContractsLong  >= 1
+shortEntrySig = haveSignal and inSegment and not killSwitch and posState == 0 and zSig >  entryZ and prospContractsShort >= 1
 stopSig       = haveSignal and posState != 0 and math.abs(zSig) > stopZ
 exitSig       = haveSignal and posState != 0 and not stopSig and math.abs(zSig) < exitZ
 segmentExitSig = not inSegment and posState != 0
 
+// Snapshot BEFORE any close-handling block below resets posState to 0, so
+// the P&L calc after them still knows which direction is being closed.
+closingPosState = posState
+
 if longEntrySig
     // Long spread = long partner, short beta*NQ -> the tradeable NQ leg is short.
-    strategy.entry("ShortNQ", strategy.short, comment = "LongSpread")
-    posState     := 1
-    entryLevel   := zSig
-    tpLevel      := -exitZ
-    slLevel      := -stopZ
-    entryPriceNQ := close
+    strategy.entry("ShortNQ", strategy.short, qty = prospContractsLong, comment = "LongSpread")
+    posState       := 1
+    entryLevel     := zSig
+    tpLevel        := -exitZ
+    slLevel        := -stopZ
+    entryPriceNQ   := close
+    slPriceAtEntry := prospSlLong
+    tradeContracts := prospContractsLong
     entryLbl := label.new(bar_index, zSig,   text = "ENTRY " + str.tostring(zSig, "#.##"), style = label.style_triangleup,  yloc = yloc.price, color = color.new(color.green, 0), textcolor = color.white, size = size.small)
     tpLbl    := label.new(bar_index, tpLevel, text = "TP " + str.tostring(tpLevel, "#.##"), style = label.style_label_left, color = color.new(color.teal, 20), textcolor = color.white, size = size.tiny)
     slLbl    := label.new(bar_index, slLevel, text = "SL " + str.tostring(slLevel, "#.##"), style = label.style_label_left, color = color.new(color.red, 20),  textcolor = color.white, size = size.tiny)
-    entryPriceLbl := label.new(bar_index, na, text = "SHORT NQ ENTRY\n" + str.tostring(close, format.mintick), style = label.style_triangledown, yloc = yloc.abovebar, color = color.new(color.red, 0), textcolor = color.white, size = size.small, force_overlay = true)
+    entryPriceLbl := label.new(bar_index, na, text = "SHORT NQ ENTRY\n" + str.tostring(close, format.mintick) + "\n" + str.tostring(tradeContracts) + " contract(s)", style = label.style_triangledown, yloc = yloc.abovebar, color = color.new(color.red, 0), textcolor = color.white, size = size.small, force_overlay = true)
 
 if shortEntrySig
     // Short spread = short partner, long beta*NQ -> the tradeable NQ leg is long.
-    strategy.entry("LongNQ", strategy.long, comment = "ShortSpread")
-    posState     := -1
-    entryLevel   := zSig
-    tpLevel      := exitZ
-    slLevel      := stopZ
-    entryPriceNQ := close
+    strategy.entry("LongNQ", strategy.long, qty = prospContractsShort, comment = "ShortSpread")
+    posState       := -1
+    entryLevel     := zSig
+    tpLevel        := exitZ
+    slLevel        := stopZ
+    entryPriceNQ   := close
+    slPriceAtEntry := prospSlShort
+    tradeContracts := prospContractsShort
     entryLbl := label.new(bar_index, zSig,   text = "ENTRY " + str.tostring(zSig, "#.##"), style = label.style_triangledown, yloc = yloc.price, color = color.new(color.red, 0),  textcolor = color.white, size = size.small)
     tpLbl    := label.new(bar_index, tpLevel, text = "TP " + str.tostring(tpLevel, "#.##"), style = label.style_label_left,  color = color.new(color.teal, 20), textcolor = color.white, size = size.tiny)
     slLbl    := label.new(bar_index, slLevel, text = "SL " + str.tostring(slLevel, "#.##"), style = label.style_label_left,  color = color.new(color.red, 20),  textcolor = color.white, size = size.tiny)
-    entryPriceLbl := label.new(bar_index, na, text = "LONG NQ ENTRY\n" + str.tostring(close, format.mintick), style = label.style_triangleup, yloc = yloc.belowbar, color = color.new(color.green, 0), textcolor = color.white, size = size.small, force_overlay = true)
+    entryPriceLbl := label.new(bar_index, na, text = "LONG NQ ENTRY\n" + str.tostring(close, format.mintick) + "\n" + str.tostring(tradeContracts) + " contract(s)", style = label.style_triangleup, yloc = yloc.belowbar, color = color.new(color.green, 0), textcolor = color.white, size = size.small, force_overlay = true)
 
 if stopSig
     strategy.close_all(comment = "Stop")
@@ -281,10 +345,21 @@ if segmentExitSig
     posState := 0
 
 if stopSig or exitSig or segmentExitSig
-    entryLevel   := na
-    tpLevel      := na
-    slLevel      := na
-    entryPriceNQ := na
+    // Informational NQ-leg $ P&L (see companion indicator's identical sign
+    // convention comment): closingPosState == 1 -> NQ leg is short, profits
+    // when price falls; == -1 -> NQ leg is long, profits when price rises.
+    // Uses the snapshot taken above, since posState is already reset to 0
+    // by the individual stop/exit/segment-end blocks above this one.
+    exitPriceNQ = close
+    pnlPts = closingPosState == 1 ? (entryPriceNQ - exitPriceNQ) : (exitPriceNQ - entryPriceNQ)
+    cumPnlUSD += pnlPts * pointValue * tradeContracts
+    killSwitch := killSwitch or (cumPnlUSD <= -maxLossUSD)
+    entryLevel     := na
+    tpLevel        := na
+    slLevel        := na
+    entryPriceNQ   := na
+    slPriceAtEntry := na
+    tradeContracts := 0
     label.delete(entryLbl)
     label.delete(tpLbl)
     label.delete(slLbl)
@@ -298,6 +373,16 @@ if stopSig or exitSig or segmentExitSig
 // every bar, not stored in `var` (see NQ PRICE PROJECTION above).
 tpPriceNQ = posState == 1 ? f_impliedNQPrice(-exitZ) : posState == -1 ? f_impliedNQPrice(exitZ) : na
 slPriceNQ = posState == 1 ? f_impliedNQPrice(-stopZ) : posState == -1 ? f_impliedNQPrice(stopZ) : na
+
+// -----------------------------------------------------------------------------
+// TRADING HALTED WARNING -- informational mirror of strategy.risk.max_drawdown()
+// tripping (see companion indicator's identical block).
+// -----------------------------------------------------------------------------
+var label haltLbl = na
+if killSwitch and barstate.islast
+    label.delete(haltLbl)
+    haltLbl := label.new(bar_index, na, text = "🛑 MAX LOSS HIT -- TRADING HALTED\nCumulative NQ P&L: $" + str.tostring(cumPnlUSD, "#.##"), style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.red, 0), textcolor = color.white, size = size.large, force_overlay = true)
+bgcolor(killSwitch ? color.new(color.red, 85) : na, title = "Trading Halted Shading", force_overlay = true)
 
 // -----------------------------------------------------------------------------
 // PLOTS -- same visual layout as the companion indicator, for side-by-side
@@ -366,10 +451,13 @@ plotshape(showMarkers and stopSig       ? zscore : na, title = "Stop-Out",      
 // segment, use the Strategy Tester's own "List of Trades" and "Performance
 // Summary" tabs (switch segmentChoice above and re-run to compare them).
 // -----------------------------------------------------------------------------
-var table infoTable = table.new(position.top_right, 2, 9, border_width = 1, force_overlay = true)
+var table infoTable = table.new(position.top_right, 2, 13, border_width = 1, force_overlay = true)
 
 if showTable and barstate.islast
     posText = posState == 1 ? "LONG SPREAD (short NQ)" : posState == -1 ? "SHORT SPREAD (long NQ)" : "FLAT"
+    budgetLeftUSD = math.max(0.0, maxLossUSD + cumPnlUSD)
+    riskTableColor = killSwitch ? color.new(color.red, 60) : color.new(color.gray, 80)
+
     table.cell(infoTable, 0, 0, "Segment",  bgcolor = color.new(color.gray, 80), text_color = color.white)
     table.cell(infoTable, 1, 0, segmentChoice, bgcolor = color.new(color.gray, 80), text_color = color.white)
     table.cell(infoTable, 0, 1, "Z-Score",  bgcolor = color.new(color.gray, 80), text_color = color.white)
@@ -377,7 +465,7 @@ if showTable and barstate.islast
     table.cell(infoTable, 0, 2, "Beta",     bgcolor = color.new(color.gray, 80), text_color = color.white)
     table.cell(infoTable, 1, 2, str.tostring(beta, "#.####"), bgcolor = color.new(color.gray, 80), text_color = color.white)
     table.cell(infoTable, 0, 3, "Position", bgcolor = color.new(color.gray, 80), text_color = color.white)
-    table.cell(infoTable, 1, 3, posText,    bgcolor = color.new(color.gray, 80), text_color = posState == 1 ? color.lime : posState == -1 ? color.red : color.white)
+    table.cell(infoTable, 1, 3, killSwitch ? "HALTED" : posText, bgcolor = color.new(color.gray, 80), text_color = killSwitch ? color.red : posState == 1 ? color.lime : posState == -1 ? color.red : color.white)
     // Always-on prospective entry thresholds, so the table is informative
     // even while flat (see ALWAYS-ON PRICE REFERENCE BANDS above).
     table.cell(infoTable, 0, 4, "Entry Threshold +", bgcolor = color.new(color.gray, 80), text_color = color.white)
@@ -390,6 +478,15 @@ if showTable and barstate.islast
     table.cell(infoTable, 1, 7, posState == 0 ? "-- (no open trade)" : na(tpPriceNQ) ? "N/A" : str.tostring(tpPriceNQ, format.mintick) + " (est.)", bgcolor = color.new(color.gray, 80), text_color = color.teal)
     table.cell(infoTable, 0, 8, "Stop Loss (NQ)", bgcolor = color.new(color.gray, 80), text_color = color.white)
     table.cell(infoTable, 1, 8, posState == 0 ? "-- (no open trade)" : na(slPriceNQ) ? "N/A" : str.tostring(slPriceNQ, format.mintick) + " (est.)", bgcolor = color.new(color.gray, 80), text_color = color.red)
+    // Position sizing / risk governor (see Prop Firm Risk Management inputs).
+    table.cell(infoTable, 0, 9, "Contracts (qty)", bgcolor = riskTableColor, text_color = color.white)
+    table.cell(infoTable, 1, 9, posState != 0 ? str.tostring(tradeContracts) : "--", bgcolor = riskTableColor, text_color = color.white)
+    table.cell(infoTable, 0, 10, "Cumulative P&L ($)", bgcolor = riskTableColor, text_color = color.white)
+    table.cell(infoTable, 1, 10, "$" + str.tostring(cumPnlUSD, "#.##"), bgcolor = riskTableColor, text_color = cumPnlUSD >= 0 ? color.lime : color.red)
+    table.cell(infoTable, 0, 11, "Loss Budget Left", bgcolor = riskTableColor, text_color = color.white)
+    table.cell(infoTable, 1, 11, killSwitch ? "$0 -- HALTED" : "$" + str.tostring(budgetLeftUSD, "#.##"), bgcolor = riskTableColor, text_color = killSwitch ? color.red : color.white)
+    table.cell(infoTable, 0, 12, "Point Value", bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 1, 12, "$" + str.tostring(pointValue, "#.##") + "/pt (" + syminfo.ticker + ")", bgcolor = color.new(color.gray, 80), text_color = color.white)
 
 // -----------------------------------------------------------------------------
 // ALERTS -- same four events as the companion indicator.

@@ -60,6 +60,17 @@
 // update, which is intentional and matches how the real exit/stop
 // condition itself works (it's also re-evaluated from live data, never
 // frozen at entry).
+//
+// PROP FIRM RISK MANAGEMENT: position size (in NQ or MNQ contracts) is
+// computed at every prospective entry from the live implied stop distance,
+// capped so a single trade risks no more than Risk Per Trade % of Max
+// Account Loss. Realized NQ-leg $ P&L accumulates across closed trades; once
+// cumulative losses reach -Max Account Loss, the kill switch latches
+// permanently and no further entries are taken (flagged with a loud on-chart
+// warning). This is a PLANNING aid, not a broker-enforced guarantee: it
+// cannot place real stop orders or talk to your prop firm's platform, and a
+// live stop can still gap past its projected price -- always place a real
+// protective stop sized the same way this script suggests.
 // =============================================================================
 indicator("NQ / Basket Z-Score Pairs Signal", shorttitle = "NQ/Basket Z", overlay = false, format = format.price)
 
@@ -69,6 +80,7 @@ indicator("NQ / Basket Z-Score Pairs Signal", shorttitle = "NQ/Basket Z", overla
 grpPartner = "Partner Instrument"
 grpBasket  = "Basket Constituents (used only when Partner = Equal-Weight Basket)"
 grpStrat   = "Strategy Parameters (tuned on NQ1! Daily -- see header)"
+grpRisk    = "Prop Firm Risk Management"
 grpDisplay = "Display"
 
 partnerChoice = input.string("Equal-Weight Basket", "Partner Instrument", options = ["Equal-Weight Basket", "QQQ", "ES1!", "XLK"], group = grpPartner, tooltip = "Equal-Weight Basket = the 10-stock index built below. Any other choice fetches that single symbol via request.security() instead and the 10-stock basket is ignored for signal purposes.")
@@ -89,6 +101,20 @@ lookbackZ   = input.int(90, "Z-Score Lookback (bars)", minval = 5, group = grpSt
 entryZ      = input.float(2.0, "Entry Threshold |z|", minval = 0.1, step = 0.1, group = grpStrat, tooltip = "Flat -> position when |z| crosses beyond this level.")
 exitZ       = input.float(0.5, "Exit-to-Flat Threshold |z|", minval = 0.0, step = 0.1, group = grpStrat, tooltip = "Position -> flat (normal exit) once |z| falls back below this level.")
 stopZ       = input.float(3.5, "Hard Stop Threshold |z|", minval = 0.1, step = 0.1, group = grpStrat, tooltip = "Position -> flat (flagged as a STOP, not a normal exit) if |z| ever exceeds this level -- the mean-reversion premise is treated as broken.")
+
+// Position sizing and a hard loss governor for a prop-firm-style account
+// where breaching a max loss / trailing drawdown limit ends the account.
+// This sizes and tracks the NQ LEG only (the actually-fundable/tradable
+// side of the pair at a prop firm -- see the companion strategy file's
+// identical NQ-leg-only limitation), using the live implied stop price
+// from the NQ PRICE PROJECTION block. It is a PLANNING/MONITORING aid, not
+// an execution guarantee: a real stop order can still gap past its price,
+// and this script cannot enforce anything on your broker/prop firm
+// platform -- always place a real protective stop order sized the same way.
+maxLossUSD      = input.float(2000, "Max Account Loss ($)", minval = 1, group = grpRisk, tooltip = "Hard ceiling on cumulative NQ-leg losses (e.g. a prop firm's max loss / trailing drawdown rule). Once hit, new entries are blocked and the chart flags TRADING HALTED.")
+riskPerTradePct = input.float(10, "Risk Per Trade (% of Max Loss)", minval = 1, maxval = 100, step = 1, group = grpRisk, tooltip = "Caps a single trade's stop-loss risk at this fraction of Max Account Loss, e.g. 10% of $2000 = $200 risked per trade -- deliberately conservative, since this pair lost money net of costs even in its best backtest segment.")
+contractType    = input.string("MNQ - Micro ($2/pt)", "Contract Type", options = ["MNQ - Micro ($2/pt)", "NQ - Full ($20/pt)"], group = grpRisk, tooltip = "Dollar value per NQ index point per contract, used for position sizing and P&L tracking below. Micro (MNQ) gives much finer position-size granularity on a small loss budget.")
+pointValue      = contractType == "NQ - Full ($20/pt)" ? 20.0 : 2.0
 
 showTable   = input.bool(true, "Show Stats Table", group = grpDisplay)
 showMarkers = input.bool(true, "Show Entry/Exit/Stop Markers", group = grpDisplay)
@@ -267,36 +293,67 @@ var label slLbl        = na
 var float entryPriceNQ = na
 var label entryPriceLbl = na
 
+// Position-sizing / loss-governor state (see Prop Firm Risk Management
+// inputs above). slPriceAtEntry/tradeContracts are FROZEN at entry -- the
+// size of a trade, once taken, doesn't change; only the live TP/SL display
+// levels (tpPriceNQ/slPriceNQ below) keep drifting. cumPnlUSD is the
+// running realized NQ-leg P&L across all closed trades, and killSwitch
+// latches permanently true once it breaches -maxLossUSD (a real prop-firm
+// breach doesn't reset itself, so neither does this).
+var float slPriceAtEntry = na
+var int   tradeContracts = 0
+var float cumPnlUSD      = 0.0
+var bool  killSwitch     = false
+
 haveSignal = not na(zSig)
 
-longEntrySig  = haveSignal and posState == 0 and zSig < -entryZ
-shortEntrySig = haveSignal and posState == 0 and zSig >  entryZ
+// Prospective stop distance / position size for EACH possible direction,
+// evaluated every bar with live data -- BEFORE any entry decision -- so a
+// trade whose stop is too wide to size even 1 micro contract within the
+// per-trade risk budget is skipped entirely rather than forced through.
+riskBudgetUSD = maxLossUSD * riskPerTradePct / 100
+
+prospSlLong  = f_impliedNQPrice(-stopZ)
+prospSlShort = f_impliedNQPrice(stopZ)
+prospDistLong  = na(prospSlLong)  ? na : math.abs(close - prospSlLong)
+prospDistShort = na(prospSlShort) ? na : math.abs(close - prospSlShort)
+prospContractsLong  = (not na(prospDistLong)  and prospDistLong  > 0) ? math.floor(riskBudgetUSD / (prospDistLong  * pointValue)) : 0
+prospContractsShort = (not na(prospDistShort) and prospDistShort > 0) ? math.floor(riskBudgetUSD / (prospDistShort * pointValue)) : 0
+
+longEntrySig  = haveSignal and not killSwitch and posState == 0 and zSig < -entryZ and prospContractsLong  >= 1
+shortEntrySig = haveSignal and not killSwitch and posState == 0 and zSig >  entryZ and prospContractsShort >= 1
 stopSig       = haveSignal and posState != 0 and math.abs(zSig) > stopZ
 exitSig       = haveSignal and posState != 0 and not stopSig and math.abs(zSig) < exitZ
 
 if longEntrySig
-    posState     := 1
-    entrySpread  := spreadSig
-    entryLevel   := zSig
-    tpLevel      := -exitZ
-    slLevel      := -stopZ
-    entryPriceNQ := close
+    // Long spread = long partner, short beta*NQ -> the NQ leg itself is short.
+    posState       := 1
+    entrySpread    := spreadSig
+    entryLevel     := zSig
+    tpLevel        := -exitZ
+    slLevel        := -stopZ
+    entryPriceNQ   := close
+    slPriceAtEntry := prospSlLong
+    tradeContracts := prospContractsLong
     entryLbl := label.new(bar_index, zSig,   text = "ENTRY " + str.tostring(zSig, "#.##"), style = label.style_triangleup,  yloc = yloc.price, color = color.new(color.green, 0), textcolor = color.white, size = size.small)
     tpLbl    := label.new(bar_index, tpLevel, text = "TP " + str.tostring(tpLevel, "#.##"), style = label.style_label_left, color = color.new(color.teal, 20), textcolor = color.white, size = size.tiny)
     slLbl    := label.new(bar_index, slLevel, text = "SL " + str.tostring(slLevel, "#.##"), style = label.style_label_left, color = color.new(color.red, 20),  textcolor = color.white, size = size.tiny)
-    entryPriceLbl := label.new(bar_index, na, text = "LONG SPREAD ENTRY\n" + str.tostring(close, format.mintick), style = label.style_triangleup, yloc = yloc.belowbar, color = color.new(color.green, 0), textcolor = color.white, size = size.small, force_overlay = true)
+    entryPriceLbl := label.new(bar_index, na, text = "LONG SPREAD ENTRY\n" + str.tostring(close, format.mintick) + "\n" + str.tostring(tradeContracts) + " contract(s)", style = label.style_triangleup, yloc = yloc.belowbar, color = color.new(color.green, 0), textcolor = color.white, size = size.small, force_overlay = true)
 
 if shortEntrySig
-    posState     := -1
-    entrySpread  := spreadSig
-    entryLevel   := zSig
-    tpLevel      := exitZ
-    slLevel      := stopZ
-    entryPriceNQ := close
+    // Short spread = short partner, long beta*NQ -> the NQ leg itself is long.
+    posState       := -1
+    entrySpread    := spreadSig
+    entryLevel     := zSig
+    tpLevel        := exitZ
+    slLevel        := stopZ
+    entryPriceNQ   := close
+    slPriceAtEntry := prospSlShort
+    tradeContracts := prospContractsShort
     entryLbl := label.new(bar_index, zSig,   text = "ENTRY " + str.tostring(zSig, "#.##"), style = label.style_triangledown, yloc = yloc.price, color = color.new(color.red, 0),  textcolor = color.white, size = size.small)
     tpLbl    := label.new(bar_index, tpLevel, text = "TP " + str.tostring(tpLevel, "#.##"), style = label.style_label_left,  color = color.new(color.teal, 20), textcolor = color.white, size = size.tiny)
     slLbl    := label.new(bar_index, slLevel, text = "SL " + str.tostring(slLevel, "#.##"), style = label.style_label_left,  color = color.new(color.red, 20),  textcolor = color.white, size = size.tiny)
-    entryPriceLbl := label.new(bar_index, na, text = "SHORT SPREAD ENTRY\n" + str.tostring(close, format.mintick), style = label.style_triangledown, yloc = yloc.abovebar, color = color.new(color.red, 0), textcolor = color.white, size = size.small, force_overlay = true)
+    entryPriceLbl := label.new(bar_index, na, text = "SHORT SPREAD ENTRY\n" + str.tostring(close, format.mintick) + "\n" + str.tostring(tradeContracts) + " contract(s)", style = label.style_triangledown, yloc = yloc.abovebar, color = color.new(color.red, 0), textcolor = color.white, size = size.small, force_overlay = true)
 
 if stopSig or exitSig
     // Spread P&L: a long-spread trade profits when the spread rose from
@@ -307,12 +364,22 @@ if stopSig or exitSig
     else
         losses += 1
     closedTrades += 1
-    posState     := 0
-    entrySpread  := na
-    entryLevel   := na
-    tpLevel      := na
-    slLevel      := na
-    entryPriceNQ := na
+    // Real $ P&L on the NQ leg at the size actually sized for this trade --
+    // posState == 1 (long spread) means the NQ leg is SHORT, so it profits
+    // when NQ price FALLS; posState == -1 (short spread) means the NQ leg
+    // is LONG, so it profits when NQ price RISES.
+    exitPriceNQ = close
+    pnlPts = posState == 1 ? (entryPriceNQ - exitPriceNQ) : (exitPriceNQ - entryPriceNQ)
+    cumPnlUSD += pnlPts * pointValue * tradeContracts
+    killSwitch := killSwitch or (cumPnlUSD <= -maxLossUSD)
+    posState       := 0
+    entrySpread    := na
+    entryLevel     := na
+    tpLevel        := na
+    slLevel        := na
+    entryPriceNQ   := na
+    slPriceAtEntry := na
+    tradeContracts := 0
     label.delete(entryLbl)
     label.delete(tpLbl)
     label.delete(slLbl)
@@ -326,6 +393,18 @@ if stopSig or exitSig
 // PROJECTION above) -- recomputed every bar, not stored in `var`.
 tpPriceNQ = posState == 1 ? f_impliedNQPrice(-exitZ) : posState == -1 ? f_impliedNQPrice(exitZ) : na
 slPriceNQ = posState == 1 ? f_impliedNQPrice(-stopZ) : posState == -1 ? f_impliedNQPrice(stopZ) : na
+
+// -----------------------------------------------------------------------------
+// TRADING HALTED WARNING -- fires once killSwitch latches true (cumulative
+// NQ-leg loss reached -maxLossUSD). Mirrors the TIMEFRAME CHECK warning
+// above: loud and impossible to miss, since new entries are blocked from
+// here on for the rest of the chart's life.
+// -----------------------------------------------------------------------------
+var label haltLbl = na
+if killSwitch and barstate.islast
+    label.delete(haltLbl)
+    haltLbl := label.new(bar_index, na, text = "🛑 MAX LOSS HIT -- TRADING HALTED\nCumulative NQ P&L: $" + str.tostring(cumPnlUSD, "#.##"), style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.red, 0), textcolor = color.white, size = size.large, force_overlay = true)
+bgcolor(killSwitch ? color.new(color.red, 85) : na, title = "Trading Halted Shading", force_overlay = true)
 
 // -----------------------------------------------------------------------------
 // PLOTS -- z-score line + reference bands (own pane, since overlay = false)
@@ -409,18 +488,20 @@ plotshape(showMarkers and stopSig       ? zscore : na, title = "Stop-Out",      
 // -----------------------------------------------------------------------------
 // STATS TABLE -- top-right, pinned onto the main chart via force_overlay
 // -----------------------------------------------------------------------------
-var table infoTable = table.new(position.top_right, 2, 10, border_width = 1, force_overlay = true)
+var table infoTable = table.new(position.top_right, 2, 13, border_width = 1, force_overlay = true)
 
 if showTable and barstate.islast
     posText = posState == 1 ? "LONG SPREAD" : posState == -1 ? "SHORT SPREAD" : "FLAT"
     winRate = closedTrades > 0 ? (wins / closedTrades) * 100.0 : na
+    budgetLeftUSD = math.max(0.0, maxLossUSD + cumPnlUSD)
+    riskTableColor = killSwitch ? color.new(color.red, 60) : color.new(color.gray, 80)
 
     table.cell(infoTable, 0, 0, "Z-Score",       bgcolor = color.new(color.gray, 80), text_color = color.white)
     table.cell(infoTable, 1, 0, str.tostring(zscore, "#.##"), bgcolor = color.new(color.gray, 80), text_color = color.white)
     table.cell(infoTable, 0, 1, "Beta",          bgcolor = color.new(color.gray, 80), text_color = color.white)
     table.cell(infoTable, 1, 1, str.tostring(beta, "#.####"), bgcolor = color.new(color.gray, 80), text_color = color.white)
     table.cell(infoTable, 0, 2, "Position",       bgcolor = color.new(color.gray, 80), text_color = color.white)
-    table.cell(infoTable, 1, 2, posText,          bgcolor = color.new(color.gray, 80), text_color = posState == 1 ? color.lime : posState == -1 ? color.red : color.white)
+    table.cell(infoTable, 1, 2, killSwitch ? "HALTED" : posText, bgcolor = color.new(color.gray, 80), text_color = killSwitch ? color.red : posState == 1 ? color.lime : posState == -1 ? color.red : color.white)
     // Always-on prospective entry thresholds (see ALWAYS-ON PRICE REFERENCE
     // BANDS above), so the table is informative even while flat.
     table.cell(infoTable, 0, 3, "Entry Threshold +", bgcolor = color.new(color.gray, 80), text_color = color.white)
@@ -433,10 +514,17 @@ if showTable and barstate.islast
     table.cell(infoTable, 1, 6, posState == 0 ? "-- (no open trade)" : na(tpPriceNQ) ? "N/A" : str.tostring(tpPriceNQ, format.mintick) + " (est.)", bgcolor = color.new(color.gray, 80), text_color = color.teal)
     table.cell(infoTable, 0, 7, "Stop Loss (NQ)", bgcolor = color.new(color.gray, 80), text_color = color.white)
     table.cell(infoTable, 1, 7, posState == 0 ? "-- (no open trade)" : na(slPriceNQ) ? "N/A" : str.tostring(slPriceNQ, format.mintick) + " (est.)", bgcolor = color.new(color.gray, 80), text_color = color.red)
-    table.cell(infoTable, 0, 8, "Closed Trades",  bgcolor = color.new(color.gray, 80), text_color = color.white)
-    table.cell(infoTable, 1, 8, str.tostring(closedTrades), bgcolor = color.new(color.gray, 80), text_color = color.white)
-    table.cell(infoTable, 0, 9, "Win Rate",       bgcolor = color.new(color.gray, 80), text_color = color.white)
-    table.cell(infoTable, 1, 9, na(winRate) ? "n/a" : str.tostring(winRate, "#.#") + "%", bgcolor = color.new(color.gray, 80), text_color = color.white)
+    // Position sizing / risk governor (see Prop Firm Risk Management inputs).
+    table.cell(infoTable, 0, 8, "Contracts (" + (contractType == "NQ - Full ($20/pt)" ? "NQ" : "MNQ") + ")", bgcolor = riskTableColor, text_color = color.white)
+    table.cell(infoTable, 1, 8, posState != 0 ? str.tostring(tradeContracts) : "--", bgcolor = riskTableColor, text_color = color.white)
+    table.cell(infoTable, 0, 9, "Cumulative P&L ($)", bgcolor = riskTableColor, text_color = color.white)
+    table.cell(infoTable, 1, 9, "$" + str.tostring(cumPnlUSD, "#.##"), bgcolor = riskTableColor, text_color = cumPnlUSD >= 0 ? color.lime : color.red)
+    table.cell(infoTable, 0, 10, "Loss Budget Left", bgcolor = riskTableColor, text_color = color.white)
+    table.cell(infoTable, 1, 10, killSwitch ? "$0 -- HALTED" : "$" + str.tostring(budgetLeftUSD, "#.##"), bgcolor = riskTableColor, text_color = killSwitch ? color.red : color.white)
+    table.cell(infoTable, 0, 11, "Closed Trades",  bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 1, 11, str.tostring(closedTrades), bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 0, 12, "Win Rate",       bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 1, 12, na(winRate) ? "n/a" : str.tostring(winRate, "#.#") + "%", bgcolor = color.new(color.gray, 80), text_color = color.white)
 
 // -----------------------------------------------------------------------------
 // ALERTS
