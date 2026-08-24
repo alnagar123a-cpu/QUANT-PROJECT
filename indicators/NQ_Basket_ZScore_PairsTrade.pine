@@ -93,6 +93,7 @@ stopZ       = input.float(3.5, "Hard Stop Threshold |z|", minval = 0.1, step = 0
 showTable   = input.bool(true, "Show Stats Table", group = grpDisplay)
 showMarkers = input.bool(true, "Show Entry/Exit/Stop Markers", group = grpDisplay)
 showBg      = input.bool(true, "Show Position Background Shading", group = grpDisplay)
+showLevels  = input.bool(true, "Show Price Reference Bands on NQ Chart (always on, not just while in a trade)", group = grpDisplay)
 
 // -----------------------------------------------------------------------------
 // BASKET CONSTRUCTION -- equal-weighted top-10 Nasdaq-100 mega-cap index
@@ -340,6 +341,33 @@ plot(posState != 0 ? tpPriceNQ    : na, title = "Take Profit (NQ, live est.)", c
 plot(posState != 0 ? slPriceNQ    : na, title = "Stop Loss (NQ, live est.)",   color = color.new(color.red, 0),   style = plot.style_linebr, linewidth = 2, force_overlay = true)
 
 // -----------------------------------------------------------------------------
+// ALWAYS-ON PRICE REFERENCE BANDS -- the entry/exit/stop lines above only
+// draw while a trade is actually open (posState != 0), so on a quiet chart
+// with no active signal, NOTHING shows on the NQ candles even though the
+// indicator is working correctly. These six bands are the SAME z-score
+// thresholds (+-entryZ, +-exitZ, +-stopZ) projected onto the NQ price axis
+// via f_impliedNQPrice(), plotted continuously regardless of position state
+// -- i.e. "if NQ traded to about this price today, here's roughly which
+// threshold it would cross." They are thin/unlabeled-by-direction because,
+// while flat, "take profit" and "stop loss" aren't yet meaningful (that
+// depends on which side you'd enter); once a trade opens, the bold
+// Entry/Take Profit/Stop Loss lines plotted just above are the SAME values,
+// specifically labeled for the side that's actually open.
+entryHiPriceNQ = f_impliedNQPrice(entryZ)
+entryLoPriceNQ = f_impliedNQPrice(-entryZ)
+exitHiPriceNQ  = f_impliedNQPrice(exitZ)
+exitLoPriceNQ  = f_impliedNQPrice(-exitZ)
+stopHiPriceNQ  = f_impliedNQPrice(stopZ)
+stopLoPriceNQ  = f_impliedNQPrice(-stopZ)
+
+plot(showLevels ? entryHiPriceNQ : na, title = "Entry Threshold + (NQ)", color = color.new(color.orange, 40), style = plot.style_line, linewidth = 1, force_overlay = true)
+plot(showLevels ? entryLoPriceNQ : na, title = "Entry Threshold - (NQ)", color = color.new(color.orange, 40), style = plot.style_line, linewidth = 1, force_overlay = true)
+plot(showLevels ? exitHiPriceNQ  : na, title = "Exit Threshold + (NQ)",  color = color.new(color.teal, 55),   style = plot.style_line, linewidth = 1, force_overlay = true)
+plot(showLevels ? exitLoPriceNQ  : na, title = "Exit Threshold - (NQ)",  color = color.new(color.teal, 55),   style = plot.style_line, linewidth = 1, force_overlay = true)
+plot(showLevels ? stopHiPriceNQ  : na, title = "Stop Threshold + (NQ)",  color = color.new(color.red, 55),    style = plot.style_line, linewidth = 1, force_overlay = true)
+plot(showLevels ? stopLoPriceNQ  : na, title = "Stop Threshold - (NQ)",  color = color.new(color.red, 55),    style = plot.style_line, linewidth = 1, force_overlay = true)
+
+// -----------------------------------------------------------------------------
 // BACKGROUND SHADING -- current position state, in both the z-score pane and
 // (via force_overlay) tinted onto the main price chart too.
 // -----------------------------------------------------------------------------
@@ -358,7 +386,7 @@ plotshape(showMarkers and stopSig       ? zscore : na, title = "Stop-Out",      
 // -----------------------------------------------------------------------------
 // STATS TABLE -- top-right, pinned onto the main chart via force_overlay
 // -----------------------------------------------------------------------------
-var table infoTable = table.new(position.top_right, 2, 8, border_width = 1, force_overlay = true)
+var table infoTable = table.new(position.top_right, 2, 10, border_width = 1, force_overlay = true)
 
 if showTable and barstate.islast
     posText = posState == 1 ? "LONG SPREAD" : posState == -1 ? "SHORT SPREAD" : "FLAT"
@@ -370,16 +398,22 @@ if showTable and barstate.islast
     table.cell(infoTable, 1, 1, str.tostring(beta, "#.####"), bgcolor = color.new(color.gray, 80), text_color = color.white)
     table.cell(infoTable, 0, 2, "Position",       bgcolor = color.new(color.gray, 80), text_color = color.white)
     table.cell(infoTable, 1, 2, posText,          bgcolor = color.new(color.gray, 80), text_color = posState == 1 ? color.lime : posState == -1 ? color.red : color.white)
-    table.cell(infoTable, 0, 3, "Entry Price (NQ)", bgcolor = color.new(color.gray, 80), text_color = color.white)
-    table.cell(infoTable, 1, 3, posState != 0 ? str.tostring(entryPriceNQ, format.mintick) : "--", bgcolor = color.new(color.gray, 80), text_color = color.white)
-    table.cell(infoTable, 0, 4, "Take Profit (NQ)", bgcolor = color.new(color.gray, 80), text_color = color.white)
-    table.cell(infoTable, 1, 4, posState != 0 ? str.tostring(tpPriceNQ, format.mintick) + " (est.)" : "--", bgcolor = color.new(color.gray, 80), text_color = color.teal)
-    table.cell(infoTable, 0, 5, "Stop Loss (NQ)", bgcolor = color.new(color.gray, 80), text_color = color.white)
-    table.cell(infoTable, 1, 5, posState != 0 ? str.tostring(slPriceNQ, format.mintick) + " (est.)" : "--", bgcolor = color.new(color.gray, 80), text_color = color.red)
-    table.cell(infoTable, 0, 6, "Closed Trades",  bgcolor = color.new(color.gray, 80), text_color = color.white)
-    table.cell(infoTable, 1, 6, str.tostring(closedTrades), bgcolor = color.new(color.gray, 80), text_color = color.white)
-    table.cell(infoTable, 0, 7, "Win Rate",       bgcolor = color.new(color.gray, 80), text_color = color.white)
-    table.cell(infoTable, 1, 7, na(winRate) ? "n/a" : str.tostring(winRate, "#.#") + "%", bgcolor = color.new(color.gray, 80), text_color = color.white)
+    // Always-on prospective entry thresholds (see ALWAYS-ON PRICE REFERENCE
+    // BANDS above), so the table is informative even while flat.
+    table.cell(infoTable, 0, 3, "Entry Threshold +", bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 1, 3, str.tostring(entryHiPriceNQ, format.mintick), bgcolor = color.new(color.gray, 80), text_color = color.orange)
+    table.cell(infoTable, 0, 4, "Entry Threshold -", bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 1, 4, str.tostring(entryLoPriceNQ, format.mintick), bgcolor = color.new(color.gray, 80), text_color = color.orange)
+    table.cell(infoTable, 0, 5, "Entry Price (NQ)", bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 1, 5, posState != 0 ? str.tostring(entryPriceNQ, format.mintick) : "-- (no open trade)", bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 0, 6, "Take Profit (NQ)", bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 1, 6, posState != 0 ? str.tostring(tpPriceNQ, format.mintick) + " (est.)" : "-- (no open trade)", bgcolor = color.new(color.gray, 80), text_color = color.teal)
+    table.cell(infoTable, 0, 7, "Stop Loss (NQ)", bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 1, 7, posState != 0 ? str.tostring(slPriceNQ, format.mintick) + " (est.)" : "-- (no open trade)", bgcolor = color.new(color.gray, 80), text_color = color.red)
+    table.cell(infoTable, 0, 8, "Closed Trades",  bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 1, 8, str.tostring(closedTrades), bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 0, 9, "Win Rate",       bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 1, 9, na(winRate) ? "n/a" : str.tostring(winRate, "#.#") + "%", bgcolor = color.new(color.gray, 80), text_color = color.white)
 
 // -----------------------------------------------------------------------------
 // ALERTS
