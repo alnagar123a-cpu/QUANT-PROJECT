@@ -49,6 +49,17 @@
 // disappears on a later recalculation. The basket/partner data itself is
 // pulled with request.security(..., lookahead = barmerge.lookahead_off) for
 // the same reason.
+//
+// ON-CHART ENTRY / TAKE-PROFIT / STOP-LOSS: the current open trade's entry,
+// take-profit, and stop-loss are drawn both in the z-score pane (native
+// units) AND, via force_overlay, directly on the NQ candles in price terms
+// (see the NQ PRICE PROJECTION block). The NQ price entry is an actual
+// historical fill price; the NQ price TP/SL are a LIVE estimate that
+// re-solves the z-score formula for NQ price every bar (holding today's
+// beta/spread stats fixed) -- they will visibly shift as those stats
+// update, which is intentional and matches how the real exit/stop
+// condition itself works (it's also re-evaluated from live data, never
+// frozen at entry).
 // =============================================================================
 indicator("NQ / Basket Z-Score Pairs Signal", shorttitle = "NQ/Basket Z", overlay = false, format = format.price)
 
@@ -157,8 +168,12 @@ beta = ta.correlation(logPartner, logNQ, hedgeWindow) * ta.stdev(logPartner, hed
 spread = logPartner - beta * logNQ
 
 // Z-score of the spread against its own rolling mean/stdev -- this is the
-// core mean-reversion signal.
-zscore = (spread - ta.sma(spread, lookbackZ)) / ta.stdev(spread, lookbackZ)
+// core mean-reversion signal. spreadMean/spreadStdev are named separately
+// (rather than inlined) so the NQ PRICE PROJECTION block below can reuse
+// the exact same rolling stats the z-score itself was built from.
+spreadMean  = ta.sma(spread, lookbackZ)
+spreadStdev = ta.stdev(spread, lookbackZ)
+zscore      = (spread - spreadMean) / spreadStdev
 
 // --- Lag by exactly one bar for every trading decision (see header) -------
 // zSig/betaSig/spreadSig are the values as of the previous, fully confirmed
@@ -167,6 +182,24 @@ zscore = (spread - ta.sma(spread, lookbackZ)) / ta.stdev(spread, lookbackZ)
 // cannot repaint intrabar.
 zSig      = zscore[1]
 spreadSig = spread[1]
+
+// -----------------------------------------------------------------------------
+// NQ PRICE PROJECTION -- inverts the z-score formula to express a target
+// z-value as an implied NQ price, so entry/TP/SL can be drawn directly on
+// the NQ candles instead of only in z-score units.
+// -----------------------------------------------------------------------------
+// Solving zscore = (logPartner - beta*logNQ - spreadMean) / spreadStdev for
+// logNQ, holding TODAY's partner price/beta/mean/stdev fixed, gives the NQ
+// log-price at which the z-score would equal zTarget right now:
+//   logNQ = (logPartner - spreadMean - zTarget * spreadStdev) / beta
+// This is a LIVE ESTIMATE, not a fixed target: beta/spreadMean/spreadStdev
+// recompute every bar (exactly like the real exit/stop condition, which is
+// also re-evaluated from live data, not frozen at entry), so the projected
+// price will drift over the life of a trade. That's intentional -- a frozen
+// snapshot would quietly drift out of sync with the actual, live z-score
+// condition that really triggers the exit/stop.
+f_impliedNQPrice(zTarget) =>
+    math.exp((logPartner - spreadMean - zTarget * spreadStdev) / beta)
 
 // -----------------------------------------------------------------------------
 // STATE MACHINE -- var int posState: 0 = flat, 1 = long spread, -1 = short spread
@@ -202,6 +235,14 @@ var label entryLbl    = na
 var label tpLbl        = na
 var label slLbl        = na
 
+// Same three levels, but on the NQ price axis so they show up directly on
+// the NQ candles (see NQ PRICE PROJECTION above). entryPriceNQ is a fixed,
+// historical fact (the actual NQ close when the trade was opened); tpPriceNQ
+// / slPriceNQ are the LIVE-updating implied price via f_impliedNQPrice(), so
+// they are computed fresh every bar below rather than stored as `var`.
+var float entryPriceNQ = na
+var label entryPriceLbl = na
+
 haveSignal = not na(zSig)
 
 longEntrySig  = haveSignal and posState == 0 and zSig < -entryZ
@@ -210,24 +251,28 @@ stopSig       = haveSignal and posState != 0 and math.abs(zSig) > stopZ
 exitSig       = haveSignal and posState != 0 and not stopSig and math.abs(zSig) < exitZ
 
 if longEntrySig
-    posState    := 1
-    entrySpread := spreadSig
-    entryLevel  := zSig
-    tpLevel     := -exitZ
-    slLevel     := -stopZ
+    posState     := 1
+    entrySpread  := spreadSig
+    entryLevel   := zSig
+    tpLevel      := -exitZ
+    slLevel      := -stopZ
+    entryPriceNQ := close
     entryLbl := label.new(bar_index, zSig,   text = "ENTRY " + str.tostring(zSig, "#.##"), style = label.style_triangleup,  yloc = yloc.price, color = color.new(color.green, 0), textcolor = color.white, size = size.small)
     tpLbl    := label.new(bar_index, tpLevel, text = "TP " + str.tostring(tpLevel, "#.##"), style = label.style_label_left, color = color.new(color.teal, 20), textcolor = color.white, size = size.tiny)
     slLbl    := label.new(bar_index, slLevel, text = "SL " + str.tostring(slLevel, "#.##"), style = label.style_label_left, color = color.new(color.red, 20),  textcolor = color.white, size = size.tiny)
+    entryPriceLbl := label.new(bar_index, na, text = "LONG SPREAD ENTRY\n" + str.tostring(close, format.mintick), style = label.style_triangleup, yloc = yloc.belowbar, color = color.new(color.green, 0), textcolor = color.white, size = size.small, force_overlay = true)
 
 if shortEntrySig
-    posState    := -1
-    entrySpread := spreadSig
-    entryLevel  := zSig
-    tpLevel     := exitZ
-    slLevel     := stopZ
+    posState     := -1
+    entrySpread  := spreadSig
+    entryLevel   := zSig
+    tpLevel      := exitZ
+    slLevel      := stopZ
+    entryPriceNQ := close
     entryLbl := label.new(bar_index, zSig,   text = "ENTRY " + str.tostring(zSig, "#.##"), style = label.style_triangledown, yloc = yloc.price, color = color.new(color.red, 0),  textcolor = color.white, size = size.small)
     tpLbl    := label.new(bar_index, tpLevel, text = "TP " + str.tostring(tpLevel, "#.##"), style = label.style_label_left,  color = color.new(color.teal, 20), textcolor = color.white, size = size.tiny)
     slLbl    := label.new(bar_index, slLevel, text = "SL " + str.tostring(slLevel, "#.##"), style = label.style_label_left,  color = color.new(color.red, 20),  textcolor = color.white, size = size.tiny)
+    entryPriceLbl := label.new(bar_index, na, text = "SHORT SPREAD ENTRY\n" + str.tostring(close, format.mintick), style = label.style_triangledown, yloc = yloc.abovebar, color = color.new(color.red, 0), textcolor = color.white, size = size.small, force_overlay = true)
 
 if stopSig or exitSig
     // Spread P&L: a long-spread trade profits when the spread rose from
@@ -238,17 +283,25 @@ if stopSig or exitSig
     else
         losses += 1
     closedTrades += 1
-    posState    := 0
-    entrySpread := na
-    entryLevel  := na
-    tpLevel     := na
-    slLevel     := na
+    posState     := 0
+    entrySpread  := na
+    entryLevel   := na
+    tpLevel      := na
+    slLevel      := na
+    entryPriceNQ := na
     label.delete(entryLbl)
     label.delete(tpLbl)
     label.delete(slLbl)
+    label.delete(entryPriceLbl)
     entryLbl := na
     tpLbl    := na
     slLbl    := na
+    entryPriceLbl := na
+
+// Live-updating TP/SL implied NQ price for the open trade (see NQ PRICE
+// PROJECTION above) -- recomputed every bar, not stored in `var`.
+tpPriceNQ = posState == 1 ? f_impliedNQPrice(-exitZ) : posState == -1 ? f_impliedNQPrice(exitZ) : na
+slPriceNQ = posState == 1 ? f_impliedNQPrice(-stopZ) : posState == -1 ? f_impliedNQPrice(stopZ) : na
 
 // -----------------------------------------------------------------------------
 // PLOTS -- z-score line + reference bands (own pane, since overlay = false)
@@ -276,6 +329,17 @@ plot(posState != 0 ? tpLevel    : na, title = "Take Profit Level (z)", color = c
 plot(posState != 0 ? slLevel    : na, title = "Stop Loss Level (z)",   color = color.new(color.red, 0),   style = plot.style_linebr, linewidth = 2)
 
 // -----------------------------------------------------------------------------
+// PLOTS -- same entry/TP/SL levels, on the NQ price axis, pushed onto the
+// main chart via force_overlay so they appear directly on the NQ candles.
+// entryPriceNQ is the actual historical fill price (fixed); tpPriceNQ/
+// slPriceNQ are the live implied-price estimate and will visibly shift bar
+// to bar as beta/spreadMean/spreadStdev update (see NQ PRICE PROJECTION).
+// -----------------------------------------------------------------------------
+plot(posState != 0 ? entryPriceNQ : na, title = "Entry Price (NQ)",            color = color.new(color.gray, 40), style = plot.style_linebr, linewidth = 1, force_overlay = true)
+plot(posState != 0 ? tpPriceNQ    : na, title = "Take Profit (NQ, live est.)", color = color.new(color.teal, 0),  style = plot.style_linebr, linewidth = 2, force_overlay = true)
+plot(posState != 0 ? slPriceNQ    : na, title = "Stop Loss (NQ, live est.)",   color = color.new(color.red, 0),   style = plot.style_linebr, linewidth = 2, force_overlay = true)
+
+// -----------------------------------------------------------------------------
 // BACKGROUND SHADING -- current position state, in both the z-score pane and
 // (via force_overlay) tinted onto the main price chart too.
 // -----------------------------------------------------------------------------
@@ -294,7 +358,7 @@ plotshape(showMarkers and stopSig       ? zscore : na, title = "Stop-Out",      
 // -----------------------------------------------------------------------------
 // STATS TABLE -- top-right, pinned onto the main chart via force_overlay
 // -----------------------------------------------------------------------------
-var table infoTable = table.new(position.top_right, 2, 5, border_width = 1, force_overlay = true)
+var table infoTable = table.new(position.top_right, 2, 8, border_width = 1, force_overlay = true)
 
 if showTable and barstate.islast
     posText = posState == 1 ? "LONG SPREAD" : posState == -1 ? "SHORT SPREAD" : "FLAT"
@@ -306,10 +370,16 @@ if showTable and barstate.islast
     table.cell(infoTable, 1, 1, str.tostring(beta, "#.####"), bgcolor = color.new(color.gray, 80), text_color = color.white)
     table.cell(infoTable, 0, 2, "Position",       bgcolor = color.new(color.gray, 80), text_color = color.white)
     table.cell(infoTable, 1, 2, posText,          bgcolor = color.new(color.gray, 80), text_color = posState == 1 ? color.lime : posState == -1 ? color.red : color.white)
-    table.cell(infoTable, 0, 3, "Closed Trades",  bgcolor = color.new(color.gray, 80), text_color = color.white)
-    table.cell(infoTable, 1, 3, str.tostring(closedTrades), bgcolor = color.new(color.gray, 80), text_color = color.white)
-    table.cell(infoTable, 0, 4, "Win Rate",       bgcolor = color.new(color.gray, 80), text_color = color.white)
-    table.cell(infoTable, 1, 4, na(winRate) ? "n/a" : str.tostring(winRate, "#.#") + "%", bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 0, 3, "Entry Price (NQ)", bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 1, 3, posState != 0 ? str.tostring(entryPriceNQ, format.mintick) : "--", bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 0, 4, "Take Profit (NQ)", bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 1, 4, posState != 0 ? str.tostring(tpPriceNQ, format.mintick) + " (est.)" : "--", bgcolor = color.new(color.gray, 80), text_color = color.teal)
+    table.cell(infoTable, 0, 5, "Stop Loss (NQ)", bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 1, 5, posState != 0 ? str.tostring(slPriceNQ, format.mintick) + " (est.)" : "--", bgcolor = color.new(color.gray, 80), text_color = color.red)
+    table.cell(infoTable, 0, 6, "Closed Trades",  bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 1, 6, str.tostring(closedTrades), bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 0, 7, "Win Rate",       bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 1, 7, na(winRate) ? "n/a" : str.tostring(winRate, "#.#") + "%", bgcolor = color.new(color.gray, 80), text_color = color.white)
 
 // -----------------------------------------------------------------------------
 // ALERTS
