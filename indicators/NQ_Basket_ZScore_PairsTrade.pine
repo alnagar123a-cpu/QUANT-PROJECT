@@ -164,11 +164,20 @@ sessionOK = timeframe.isdaily or timeframe.isweekly or timeframe.ismonthly or no
 // bars-per-RTH-day (390 minutes = one 6.5-hour NYSE session) so they still
 // span roughly the same number of TRADING DAYS as intended, not just "90
 // bars" of whatever the chart's native resolution happens to be.
+// CLAMPED to maxTaLength: Pine's ta.* functions hard-cap how many
+// historical bars a length argument can reference at 5000 (confirmed by
+// TradingView's own compile error on unclamped values -- "references too
+// many historical candles"), so the scaled window is capped just under
+// that ceiling. On very fine timeframes (e.g. 1-minute) this means the
+// window ends up shorter than a true 90-trading-day equivalent -- still
+// far better than the unscaled 90 raw bars, just not a full match.
+maxTaLength    = 4500
 minutesPerBar  = timeframe.in_seconds(timeframe.period) / 60
 barsPerRTHDay  = minutesPerBar > 0 ? math.max(1, math.round(390 / minutesPerBar)) : 1
 scaleWindows   = autoScaleWindows and not timeframe.isdaily and not timeframe.isweekly and not timeframe.ismonthly
-effHedgeWindow = scaleWindows ? hedgeWindow * barsPerRTHDay : hedgeWindow
-effLookbackZ   = scaleWindows ? lookbackZ   * barsPerRTHDay : lookbackZ
+effHedgeWindow = scaleWindows ? math.min(maxTaLength, hedgeWindow * barsPerRTHDay) : hedgeWindow
+effLookbackZ   = scaleWindows ? math.min(maxTaLength, lookbackZ   * barsPerRTHDay) : lookbackZ
+windowClamped  = scaleWindows and (hedgeWindow * barsPerRTHDay > maxTaLength or lookbackZ * barsPerRTHDay > maxTaLength)
 
 // Both intraday mitigations on = a softer informational note. Either one
 // off (or on Daily, where neither applies/matters) = no note needed if
@@ -182,7 +191,7 @@ if barstate.islast
     if showTfAlarm
         tfWarnLbl := label.new(bar_index, na, text = "⚠ WRONG TIMEFRAME\nTuned for the DAILY chart -- current: " + timeframe.period + "\nEnable RTH Session Filter + Auto-Scale Windows\n(Intraday Accommodation group) or switch to Daily.", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.orange, 0), textcolor = color.black, size = size.large, force_overlay = true)
     else if intradayAdapted
-        tfWarnLbl := label.new(bar_index, na, text = "ℹ INTRADAY MODE (" + timeframe.period + "): RTH-filtered, windows auto-scaled to ~" + str.tostring(effHedgeWindow) + " bars.\nStill not independently validated intraday -- see header.", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.blue, 0), textcolor = color.white, size = size.normal, force_overlay = true)
+        tfWarnLbl := label.new(bar_index, na, text = "ℹ INTRADAY MODE (" + timeframe.period + "): RTH-filtered, windows auto-scaled to ~" + str.tostring(effHedgeWindow) + " bars" + (windowClamped ? " (capped at Pine's 5000-bar ta.* limit -- shorter than a full 90-trading-day equivalent)" : "") + ".\nStill not independently validated intraday -- see header.", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.blue, 0), textcolor = color.white, size = size.normal, force_overlay = true)
 
 // -----------------------------------------------------------------------------
 // BASKET CONSTRUCTION -- equal-weighted top-10 Nasdaq-100 mega-cap index
