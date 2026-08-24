@@ -331,3 +331,12 @@ if barstate.islast
     table.cell(diagTable, 1, 6, str.tostring(cntMSS), text_color = color.white)
     table.cell(diagTable, 0, 7, "Orders filled", text_color = color.white)
     table.cell(diagTable, 1, 7, str.tostring(cntFilled), text_color = color.white)
+
+// -----------------------------------------------------------------------------
+// FALLBACK DIAGNOSTIC -- background shading, in case the table above is
+// hidden behind TradingView's own legend/panel UI. This paints directly on
+// the chart itself so it can't be obscured: green tint = LONG bias today,
+// red tint = SHORT bias today, no tint = NONE. A yellow tint on top means
+// the sequence has reached FVG-formed or later that day.
+bgcolor(dailyBias == 1 ? color.new(color.green, 85) : dailyBias == -1 ? color.new(color.red, 85) : na, title = "Daily Bias Shading")
+bgcolor(seqState >= 3 ? color.new(color.yellow, 60) : na, title = "FVG-or-later Stage Shading")
