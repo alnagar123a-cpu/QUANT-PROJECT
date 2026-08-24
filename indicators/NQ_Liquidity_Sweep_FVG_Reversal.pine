@@ -286,12 +286,8 @@ if barstate.isconfirmed and dailyBias != 0
                 seqState   := 6
 
 // -----------------------------------------------------------------------------
-// PLOTS -- Buy / Sell / TP / SL only
+// PLOTS -- Buy / Sell signals only
 // -----------------------------------------------------------------------------
-plot(seqState == 4 or seqState == 5 ? entryPrice : na, "Entry", color = color.new(color.blue, 0), style = plot.style_linebr, linewidth = 2)
-plot(seqState == 4 or seqState == 5 ? stopPrice  : na, "Stop Loss",   color = color.new(color.red, 0),   style = plot.style_linebr, linewidth = 1)
-plot(seqState == 4 or seqState == 5 ? tpPrice    : na, "Take Profit", color = color.new(color.green, 0), style = plot.style_linebr, linewidth = 1)
-
 plotshape(longEntrySignal,  title = "BUY",  text = "BUY",  style = shape.labelup,   location = location.belowbar, color = color.new(color.lime, 0), textcolor = color.black, size = size.small)
 plotshape(shortEntrySignal, title = "SELL", text = "SELL", style = shape.labeldown, location = location.abovebar, color = color.new(color.red, 0),  textcolor = color.white, size = size.small)
 
