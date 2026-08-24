@@ -311,12 +311,15 @@ if showHistory and barstate.islast
     table.cell(historyTable, 0, 0, "Time",   text_color = color.white, bgcolor = color.new(color.gray, 20))
     table.cell(historyTable, 1, 0, "Signal", text_color = color.white, bgcolor = color.new(color.gray, 20))
     table.cell(historyTable, 2, 0, "Price",  text_color = color.white, bgcolor = color.new(color.gray, 20))
-    for i = 0 to array.size(sigTimeArr) - 1
-        sigType  = array.get(sigTypeArr, i)
-        rowColor = sigType == "BUY" ? color.new(color.green, 75) : color.new(color.red, 75)
-        table.cell(historyTable, 0, i + 1, array.get(sigTimeArr, i), text_color = color.white, bgcolor = rowColor)
-        table.cell(historyTable, 1, i + 1, sigType, text_color = color.white, bgcolor = rowColor)
-        table.cell(historyTable, 2, i + 1, str.tostring(array.get(sigPriceArr, i), format.mintick), text_color = color.white, bgcolor = rowColor)
+    // Pine's "for i = 0 to N-1" counts DOWN from 0 when N-1 is negative
+    // (empty array) instead of skipping the loop, so guard explicitly.
+    if array.size(sigTimeArr) > 0
+        for i = 0 to array.size(sigTimeArr) - 1
+            sigType  = array.get(sigTypeArr, i)
+            rowColor = sigType == "BUY" ? color.new(color.green, 75) : color.new(color.red, 75)
+            table.cell(historyTable, 0, i + 1, array.get(sigTimeArr, i), text_color = color.white, bgcolor = rowColor)
+            table.cell(historyTable, 1, i + 1, sigType, text_color = color.white, bgcolor = rowColor)
+            table.cell(historyTable, 2, i + 1, str.tostring(array.get(sigPriceArr, i), format.mintick), text_color = color.white, bgcolor = rowColor)
 
 // -----------------------------------------------------------------------------
 // PLOTS -- Buy / Sell signals only
