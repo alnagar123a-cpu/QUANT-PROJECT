@@ -7,8 +7,9 @@
 // Minimal signal indicator: a 1H-EMA trend bias filters direction, a
 // liquidity sweep + reclaim + Fair Value Gap + market structure shift
 // (the mechanics behind the full ruleset) triggers the entry, and the
-// chart shows nothing but the BUY/SELL arrow, one Stop Loss line, and one
-// Take Profit line for the single active trade.
+// chart shows nothing but a BUY/SELL label per signal plus a small
+// top-left table logging the recent signals (time, direction, price) so
+// past calls stay visible without scrolling back through the chart.
 //
 // STATUS: draft, not backtested. Not financial advice.
 //
@@ -38,6 +39,9 @@ swingLR     = input.int(2, "Fractal Swing Bars (each side)", minval = 1)
 stopBufferTicks = input.float(2, "Stop Buffer Beyond Sweep Extreme (ticks)", minval = 0, step = 0.5)
 tpRMult          = input.float(2.0, "Take Profit (R multiple, if no nearer opposing level)", minval = 0.1)
 orderQty         = input.int(1, "Order Quantity (contracts, for webhook payload)", minval = 1)
+
+showHistory    = input.bool(true, "Show Signal History Table")
+maxHistoryRows = input.int(8, "Signal History Rows", minval = 1, maxval = 20)
 
 // -----------------------------------------------------------------------------
 // HELPERS
@@ -284,6 +288,35 @@ if barstate.isconfirmed and dailyBias != 0
             else if low <= tpPrice
                 shortTPHit := true
                 seqState   := 6
+
+// -----------------------------------------------------------------------------
+// SIGNAL HISTORY -- keeps a running log of past BUY/SELL calls
+// -----------------------------------------------------------------------------
+var array<string> sigTimeArr  = array.new_string()
+var array<string> sigTypeArr  = array.new_string()
+var array<float>  sigPriceArr = array.new_float()
+
+if longEntrySignal or shortEntrySignal
+    array.unshift(sigTimeArr, str.format_time(time, "MMM d HH:mm", sessTZ))
+    array.unshift(sigTypeArr, longEntrySignal ? "BUY" : "SELL")
+    array.unshift(sigPriceArr, entryPrice)
+    if array.size(sigTimeArr) > maxHistoryRows
+        array.pop(sigTimeArr)
+        array.pop(sigTypeArr)
+        array.pop(sigPriceArr)
+
+var table historyTable = table.new(position.top_left, 3, maxHistoryRows + 1, border_width = 1)
+
+if showHistory and barstate.islast
+    table.cell(historyTable, 0, 0, "Time",   text_color = color.white, bgcolor = color.new(color.gray, 20))
+    table.cell(historyTable, 1, 0, "Signal", text_color = color.white, bgcolor = color.new(color.gray, 20))
+    table.cell(historyTable, 2, 0, "Price",  text_color = color.white, bgcolor = color.new(color.gray, 20))
+    for i = 0 to array.size(sigTimeArr) - 1
+        sigType  = array.get(sigTypeArr, i)
+        rowColor = sigType == "BUY" ? color.new(color.green, 75) : color.new(color.red, 75)
+        table.cell(historyTable, 0, i + 1, array.get(sigTimeArr, i), text_color = color.white, bgcolor = rowColor)
+        table.cell(historyTable, 1, i + 1, sigType, text_color = color.white, bgcolor = rowColor)
+        table.cell(historyTable, 2, i + 1, str.tostring(array.get(sigPriceArr, i), format.mintick), text_color = color.white, bgcolor = rowColor)
 
 // -----------------------------------------------------------------------------
 // PLOTS -- Buy / Sell signals only
