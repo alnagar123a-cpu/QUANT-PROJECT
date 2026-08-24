@@ -1,0 +1,286 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//@version=5
+
+// =============================================================================
+// NQ Liquidity Sweep + FVG Reversal -- Backtest (fake-money strategy tester)
+//
+// Same trigger logic as indicators/NQ_Liquidity_Sweep_FVG_Reversal.pine (1H
+// trend bias -> liquidity sweep -> reclaim -> FVG -> market structure shift),
+// but wired up as a strategy() instead of an indicator() so TradingView's
+// Strategy Tester tab (Performance Summary / List of Trades) reports Win
+// Rate, Profit Factor, Max Drawdown, Net Profit, etc. against historical
+// data automatically -- no live paper account or real time needed.
+//
+// STATUS: draft, unvalidated ruleset. This script is the validation tool,
+// not a proven edge -- see the Strategy Properties inputs below for
+// commission/slippage, and always check both the in-sample and an
+// out-of-sample date range before trusting the numbers.
+//
+// HOW TO READ RESULTS: open the "Strategy Tester" tab at the bottom of
+// TradingView after adding this to a 5-minute NQ/MNQ chart. "Percent
+// Profitable" in the Performance Summary is the win rate. Use the
+// "List of Trades" tab to inspect individual entries/exits.
+// =============================================================================
+strategy("NQ Liquidity Sweep + FVG Reversal - Backtest", shorttitle = "NQ Sweep+FVG BT", overlay = true,
+     initial_capital = 30000,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     commission_type = strategy.commission.cash_per_contract,
+     commission_value = 2.25,
+     slippage = 2,
+     pyramiding = 0)
+
+// -----------------------------------------------------------------------------
+// INPUTS
+// -----------------------------------------------------------------------------
+killzoneSess = input.session("0930-1100", "AM Killzone (new entries only)")
+sessTZ       = input.string("America/New_York", "Session Timezone")
+onSess       = input.session("1800-0930", "Overnight Session")
+ibSess       = input.session("0930-1030", "Initial Balance Session")
+
+biasTF      = input.timeframe("60", "Bias Timeframe")
+emaLen      = input.int(20, "Bias EMA Length", minval = 1)
+emaLookback = input.int(5, "EMA Slope Lookback (HTF bars)", minval = 1)
+
+sweepTicks  = input.int(1, "Min Sweep Distance (ticks beyond level)", minval = 1)
+reclaimBars = input.int(3, "Reclaim Within (candles, incl. sweep candle)", minval = 1)
+fvgMaxBars  = input.int(5, "FVG + MSS Deadline (candles after sweep)", minval = 1)
+swingLR     = input.int(2, "Fractal Swing Bars (each side)", minval = 1)
+
+stopBufferTicks = input.float(2, "Stop Buffer Beyond Sweep Extreme (ticks)", minval = 0, step = 0.5)
+tpRMult          = input.float(2.0, "Take Profit (R multiple, if no nearer opposing level)", minval = 0.1)
+orderQty         = input.int(1, "Order Quantity (contracts)", minval = 1)
+
+// -----------------------------------------------------------------------------
+// HELPERS
+// -----------------------------------------------------------------------------
+f_nearestAbove(entry, a, b, c) =>
+    float best = na
+    if not na(a) and a > entry
+        best := a
+    if not na(b) and b > entry
+        best := na(best) ? b : math.min(best, b)
+    if not na(c) and c > entry
+        best := na(best) ? c : math.min(best, c)
+    best
+
+f_nearestBelow(entry, a, b, c) =>
+    float best = na
+    if not na(a) and a < entry
+        best := a
+    if not na(b) and b < entry
+        best := na(best) ? b : math.max(best, b)
+    if not na(c) and c < entry
+        best := na(best) ? c : math.max(best, c)
+    best
+
+// -----------------------------------------------------------------------------
+// SESSION / TIME
+// -----------------------------------------------------------------------------
+nyHour   = hour(time, sessTZ)
+nyMinute = minute(time, sessTZ)
+isSessionStart = nyHour == 9 and nyMinute == 30
+
+inKillzone = not na(time(timeframe.period, killzoneSess, sessTZ))
+inON       = not na(time(timeframe.period, onSess, sessTZ))
+inIB       = not na(time(timeframe.period, ibSess, sessTZ))
+
+// -----------------------------------------------------------------------------
+// LIQUIDITY LEVELS
+// -----------------------------------------------------------------------------
+var float onHigh = na
+var float onLow  = na
+onStart = inON and not inON[1]
+if onStart
+    onHigh := high
+    onLow  := low
+else if inON
+    onHigh := math.max(onHigh, high)
+    onLow  := math.min(onLow, low)
+
+var float ibHigh = na
+var float ibLow  = na
+ibStart = inIB and not inIB[1]
+if ibStart
+    ibHigh := high
+    ibLow  := low
+else if inIB
+    ibHigh := math.max(ibHigh, high)
+    ibLow  := math.min(ibLow, low)
+
+[pdHigh, pdLow, pdClose] = request.security(syminfo.tickerid, "D", [high[1], low[1], close[1]], lookahead = barmerge.lookahead_off)
+[htfEmaNow, htfEmaPrev, htfCloseNow] = request.security(syminfo.tickerid, biasTF, [ta.ema(close, emaLen)[1], ta.ema(close, emaLen)[emaLookback + 1], close[1]], lookahead = barmerge.lookahead_off)
+
+// -----------------------------------------------------------------------------
+// STATE
+// -----------------------------------------------------------------------------
+var int   dailyBias = 0
+var int   seqState  = 0     // 0 idle,1 swept,2 reclaimed,3 fvg,4 order working,5 in trade,6 done
+var float sweptLevel      = na
+var int   sweepBarIdx     = na
+var float sweepExtreme    = na
+var int   reclaimDeadlineBar = na
+var int   reclaimBarIdx   = na
+var int   fvgDeadlineBar  = na
+var float fvgTop = na
+var float fvgBot = na
+var float fvgMid = na
+
+var float entryPrice = na
+var float stopPrice  = na
+var float tpPrice    = na
+
+// -----------------------------------------------------------------------------
+// FRACTAL SWINGS
+// -----------------------------------------------------------------------------
+swH = ta.pivothigh(high, swingLR, swingLR)
+swL = ta.pivotlow(low, swingLR, swingLR)
+
+var float lastSwingHighPrice = na
+var int   lastSwingHighBar   = na
+var float lastSwingLowPrice  = na
+var int   lastSwingLowBar    = na
+
+if not na(swH)
+    lastSwingHighPrice := swH
+    lastSwingHighBar   := bar_index - swingLR
+if not na(swL)
+    lastSwingLowPrice := swL
+    lastSwingLowBar   := bar_index - swingLR
+
+// -----------------------------------------------------------------------------
+// DAY RESET -- bias locked once at 9:30 AM ET
+// -----------------------------------------------------------------------------
+if isSessionStart and barstate.isconfirmed
+    biasLongCond  = htfCloseNow > htfEmaNow and htfEmaNow > htfEmaPrev
+    biasShortCond = htfCloseNow < htfEmaNow and htfEmaNow < htfEmaPrev
+    rawBias   = biasLongCond ? 1 : biasShortCond ? -1 : 0
+    priceVsPD = close > pdClose ? 1 : close < pdClose ? -1 : 0
+    dailyBias := (rawBias != 0 and rawBias == priceVsPD) ? rawBias : 0
+
+    seqState           := 0
+    sweptLevel          := na
+    sweepBarIdx          := na
+    sweepExtreme         := na
+    reclaimDeadlineBar   := na
+    reclaimBarIdx        := na
+    fvgDeadlineBar       := na
+    fvgTop               := na
+    fvgBot               := na
+    fvgMid               := na
+    entryPrice           := na
+    stopPrice            := na
+    tpPrice              := na
+
+// -----------------------------------------------------------------------------
+// SWEEP -> RECLAIM -> FVG -> MSS -> ENTRY -> STOP/TARGET
+// -----------------------------------------------------------------------------
+if barstate.isconfirmed and dailyBias != 0
+    if seqState == 0
+        if inKillzone
+            bool swept = false
+            if dailyBias == 1
+                swept := not na(onLow[1]) and low <= onLow[1] - sweepTicks * syminfo.mintick
+                swept := swept or (not na(ibLow[1]) and low <= ibLow[1] - sweepTicks * syminfo.mintick)
+                swept := swept or (not na(pdLow[1]) and low <= pdLow[1] - sweepTicks * syminfo.mintick)
+            else
+                swept := not na(onHigh[1]) and high >= onHigh[1] + sweepTicks * syminfo.mintick
+                swept := swept or (not na(ibHigh[1]) and high >= ibHigh[1] + sweepTicks * syminfo.mintick)
+                swept := swept or (not na(pdHigh[1]) and high >= pdHigh[1] + sweepTicks * syminfo.mintick)
+
+            if swept
+                float lvlOn = (not na(onLow[1]) and dailyBias == 1 and low <= onLow[1] - sweepTicks * syminfo.mintick) or (not na(onHigh[1]) and dailyBias == -1 and high >= onHigh[1] + sweepTicks * syminfo.mintick) ? (dailyBias == 1 ? onLow[1] : onHigh[1]) : na
+                float lvlIb = (not na(ibLow[1]) and dailyBias == 1 and low <= ibLow[1] - sweepTicks * syminfo.mintick) or (not na(ibHigh[1]) and dailyBias == -1 and high >= ibHigh[1] + sweepTicks * syminfo.mintick) ? (dailyBias == 1 ? ibLow[1] : ibHigh[1]) : na
+                float lvlPd = (not na(pdLow[1]) and dailyBias == 1 and low <= pdLow[1] - sweepTicks * syminfo.mintick) or (not na(pdHigh[1]) and dailyBias == -1 and high >= pdHigh[1] + sweepTicks * syminfo.mintick) ? (dailyBias == 1 ? pdLow[1] : pdHigh[1]) : na
+
+                float chosen = na
+                if not na(lvlOn)
+                    chosen := lvlOn
+                if not na(lvlIb) and (na(chosen) or math.abs(close - lvlIb) < math.abs(close - chosen))
+                    chosen := lvlIb
+                if not na(lvlPd) and (na(chosen) or math.abs(close - lvlPd) < math.abs(close - chosen))
+                    chosen := lvlPd
+
+                sweptLevel         := chosen
+                sweepBarIdx        := bar_index
+                sweepExtreme       := dailyBias == 1 ? low : high
+                reclaimDeadlineBar := bar_index + reclaimBars - 1
+                seqState           := 1
+
+                if dailyBias == 1 ? close > chosen : close < chosen
+                    reclaimBarIdx  := bar_index
+                    fvgDeadlineBar := bar_index + fvgMaxBars
+                    seqState       := 2
+
+    else if seqState == 1
+        if bar_index > reclaimDeadlineBar
+            seqState := 0
+        else if (dailyBias == 1 ? close > sweptLevel : close < sweptLevel)
+            reclaimBarIdx  := bar_index
+            fvgDeadlineBar := sweepBarIdx + fvgMaxBars
+            seqState       := 2
+
+    else if seqState == 2
+        if bar_index > fvgDeadlineBar
+            seqState := 0
+        else
+            candle1Idx = bar_index - 2
+            if candle1Idx > reclaimBarIdx
+                bullFVG = dailyBias == 1 and low > high[2]
+                bearFVG = dailyBias == -1 and high < low[2]
+                if bullFVG or bearFVG
+                    if dailyBias == 1
+                        fvgBot := high[2]
+                        fvgTop := low
+                    else
+                        fvgTop := low[2]
+                        fvgBot := high
+                    fvgMid   := (fvgTop + fvgBot) / 2
+                    seqState := 3
+
+    else if seqState == 3
+        if bar_index > fvgDeadlineBar
+            seqState := 0
+        else
+            bool mssOK = false
+            if dailyBias == 1
+                mssOK := not na(lastSwingHighBar) and lastSwingHighBar > sweepBarIdx and close > lastSwingHighPrice
+            else
+                mssOK := not na(lastSwingLowBar) and lastSwingLowBar > sweepBarIdx and close < lastSwingLowPrice
+            if mssOK
+                entryPrice := fvgMid
+                stopPrice  := dailyBias == 1 ? sweepExtreme - stopBufferTicks * syminfo.mintick : sweepExtreme + stopBufferTicks * syminfo.mintick
+                rPoints    = math.abs(entryPrice - stopPrice)
+
+                float nearOpp = na
+                if dailyBias == 1
+                    nearOpp := f_nearestAbove(entryPrice, onHigh, ibHigh, pdHigh)
+                else
+                    nearOpp := f_nearestBelow(entryPrice, onLow, ibLow, pdLow)
+
+                if dailyBias == 1
+                    tpPrice := na(nearOpp) ? entryPrice + tpRMult * rPoints : math.min(nearOpp, entryPrice + tpRMult * rPoints)
+                else
+                    tpPrice := na(nearOpp) ? entryPrice - tpRMult * rPoints : math.max(nearOpp, entryPrice - tpRMult * rPoints)
+
+                seqState := 4
+                if dailyBias == 1
+                    strategy.entry("Long", strategy.long, qty = orderQty, limit = entryPrice)
+                else
+                    strategy.entry("Short", strategy.short, qty = orderQty, limit = entryPrice)
+
+    else if seqState == 4
+        filledNow = dailyBias == 1 ? strategy.position_size > 0 : strategy.position_size < 0
+        if filledNow
+            seqState := 5
+            if dailyBias == 1
+                strategy.exit("Exit Long", from_entry = "Long", stop = stopPrice, limit = tpPrice, qty = orderQty)
+            else
+                strategy.exit("Exit Short", from_entry = "Short", stop = stopPrice, limit = tpPrice, qty = orderQty)
+        else if not inKillzone
+            strategy.cancel(dailyBias == 1 ? "Long" : "Short")
+            seqState := 6
+
+    else if seqState == 5
+        if strategy.position_size == 0
+            seqState := 6
