@@ -1,0 +1,259 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//@version=5
+
+// =============================================================================
+// NQ / Mega-Cap Basket Z-Score Pairs Strategy (companion to the indicator of
+// the same name in /indicators) -- FOR INDEPENDENT VERIFICATION IN THE
+// STRATEGY TESTER, NOT AS A PROVEN PROFITABLE SYSTEM.
+//
+// PINE VERSION NOTE: written against //@version=5, for the same reason as
+// the companion indicator -- no live TradingView editor was available here
+// to compile/verify Pine v6-specific syntax, and this repo's existing
+// script is also v5. Upgrade the version pragma yourself if you want v6.
+//
+// SOURCE / METHODOLOGY: replicates one specific rule from a completed
+// backtest on SYNTHETIC daily data (2018-2026, train -> validate -> test
+// split, 5 candidate pairs tested). NQ vs. an equal-weighted top-10
+// Nasdaq-100 mega-cap basket had the best win rate (42.9%) and best
+// Sharpe/profit factor of the five -- and STILL lost money net of costs
+// out-of-sample: -6.4% return, -17.8% max drawdown in the test window. This
+// script exists to let you re-run that same rule, segment by segment
+// (Train / Validation / Test), against TradingView's own historical data as
+// an independent check -- it is not evidence the strategy works, and a
+// different result on real data than on the synthetic backtest should be
+// expected and is the whole point of re-validating here.
+//
+// CHART CONTEXT: run this on NQ1! (CME Nasdaq-100 E-mini continuous
+// futures), Daily timeframe -- every default parameter was tuned on daily
+// bars and will not carry the same meaning on another symbol or timeframe.
+//
+// *** IMPORTANT LIMITATION: NQ LEG ONLY ***
+// TradingView's Strategy Tester can only simulate orders against the
+// chart's own symbol (NQ here) -- it cannot place a real, P&L-tracked order
+// on the partner/basket leg in the same backtest run. So this strategy
+// trades only the NQ side of the pair, directionally, using the same
+// z-score signal as the indicator:
+//   long spread state  (long partner, short beta*NQ) -> this strategy is SHORT NQ
+//   short spread state (short partner, long beta*NQ)  -> this strategy is LONG NQ
+// That means the "List of Trades" / "Performance Summary" you get here
+// verify the SIGNAL (its timing, frequency, and the NQ leg's own P&L) --
+// they do NOT reproduce the fully-hedged two-legged spread P&L or costs
+// that the original synthetic backtest measured. Full two-legged
+// verification requires an external multi-asset backtesting environment,
+// same as the original backtest used.
+//
+// NO-REPAINT DESIGN: identical to the companion indicator -- beta/spread/
+// zscore recompute every bar, but every entry/exit/stop DECISION is
+// evaluated off zscore[1] (the previous, fully confirmed bar's close), so a
+// decision made "on" bar T only ever uses data knowable at T's open. Orders
+// are configured to fill at that same bar's close (process_orders_on_close
+// = true below) -- i.e. "decide from yesterday's confirmed close, transact
+// by today's close" -- a single, consistent, conservative day of lag from
+// information to execution, and it keeps this strategy's fills bar-aligned
+// with the indicator's plotted markers for direct comparison.
+//
+// COSTS: commission/slippage defaults are set below in the strategy()
+// declaration (Pine requires literal, not input-driven, values there).
+// Override them without touching code via the Strategy Tester's own
+// "Properties" tab (commission, slippage, initial capital, order size).
+// =============================================================================
+strategy("NQ / Basket Z-Score Pairs Strategy [NQ leg]", shorttitle = "NQ/Basket Z Strat", overlay = false, initial_capital = 100000, currency = currency.USD, default_qty_type = strategy.fixed, default_qty_value = 1, commission_type = strategy.commission.cash_per_contract, commission_value = 2.0, slippage = 2, process_orders_on_close = true, calc_on_every_tick = false)
+
+// -----------------------------------------------------------------------------
+// INPUTS -- identical strategy inputs to the companion indicator, plus the
+// Train / Validation / Test segment controls.
+// -----------------------------------------------------------------------------
+grpPartner = "Partner Instrument"
+grpBasket  = "Basket Constituents (used only when Partner = Equal-Weight Basket)"
+grpStrat   = "Strategy Parameters (tuned on NQ1! Daily -- see header)"
+grpSeg     = "Backtest Segment (Train -> Validate -> Test)"
+grpDisplay = "Display"
+
+partnerChoice = input.string("Equal-Weight Basket", "Partner Instrument", options = ["Equal-Weight Basket", "QQQ", "ES1!", "XLK"], group = grpPartner)
+
+sym1  = input.symbol("AAPL",  "Constituent 1",  group = grpBasket)
+sym2  = input.symbol("MSFT",  "Constituent 2",  group = grpBasket)
+sym3  = input.symbol("NVDA",  "Constituent 3",  group = grpBasket)
+sym4  = input.symbol("AMZN",  "Constituent 4",  group = grpBasket)
+sym5  = input.symbol("META",  "Constituent 5",  group = grpBasket)
+sym6  = input.symbol("GOOGL", "Constituent 6",  group = grpBasket)
+sym7  = input.symbol("AVGO",  "Constituent 7",  group = grpBasket)
+sym8  = input.symbol("TSLA",  "Constituent 8",  group = grpBasket)
+sym9  = input.symbol("COST",  "Constituent 9",  group = grpBasket)
+sym10 = input.symbol("NFLX",  "Constituent 10", group = grpBasket)
+
+hedgeWindow = input.int(90, "Hedge Ratio Window (bars)", minval = 5, group = grpStrat)
+lookbackZ   = input.int(90, "Z-Score Lookback (bars)", minval = 5, group = grpStrat)
+entryZ      = input.float(2.0, "Entry Threshold |z|", minval = 0.1, step = 0.1, group = grpStrat)
+exitZ       = input.float(0.5, "Exit-to-Flat Threshold |z|", minval = 0.0, step = 0.1, group = grpStrat)
+stopZ       = input.float(3.5, "Hard Stop Threshold |z|", minval = 0.1, step = 0.1, group = grpStrat)
+
+// Which of the three windows below is actually traded. Flip this and re-run
+// to compare segments, matching the original backtest's methodology.
+segmentChoice = input.string("Test (2024-01-01 to 2026-08-23)", "Active Segment", options = ["Train (2018-01-01 to 2021-12-31)", "Validation (2022-01-01 to 2023-12-31)", "Test (2024-01-01 to 2026-08-23)", "All History (ignore segment dates)"], group = grpSeg)
+
+trainStart = input.time(timestamp(2018, 1, 1, 0, 0, 0),    "Train Start",      group = grpSeg)
+trainEnd   = input.time(timestamp(2021, 12, 31, 23, 59, 59), "Train End",      group = grpSeg)
+valStart   = input.time(timestamp(2022, 1, 1, 0, 0, 0),    "Validation Start", group = grpSeg)
+valEnd     = input.time(timestamp(2023, 12, 31, 23, 59, 59), "Validation End", group = grpSeg)
+testStart  = input.time(timestamp(2024, 1, 1, 0, 0, 0),    "Test Start",       group = grpSeg)
+testEnd    = input.time(timestamp(2026, 8, 23, 23, 59, 59), "Test End",        group = grpSeg)
+
+showTable   = input.bool(true, "Show Stats Table", group = grpDisplay)
+showMarkers = input.bool(true, "Show Entry/Exit/Stop Markers", group = grpDisplay)
+showBg      = input.bool(true, "Show Position Background Shading", group = grpDisplay)
+
+segStart = segmentChoice == "Train (2018-01-01 to 2021-12-31)"      ? trainStart :
+     segmentChoice == "Validation (2022-01-01 to 2023-12-31)" ? valStart   :
+     segmentChoice == "Test (2024-01-01 to 2026-08-23)"       ? testStart  : timestamp(1970, 1, 1, 0, 0, 0)
+
+segEnd = segmentChoice == "Train (2018-01-01 to 2021-12-31)"      ? trainEnd :
+     segmentChoice == "Validation (2022-01-01 to 2023-12-31)" ? valEnd   :
+     segmentChoice == "Test (2024-01-01 to 2026-08-23)"       ? testEnd  : timestamp(2099, 12, 31, 23, 59, 59)
+
+inSegment = time >= segStart and time <= segEnd
+
+// -----------------------------------------------------------------------------
+// BASKET CONSTRUCTION -- identical to the companion indicator (see its
+// comments for the "first bar in view" / persistent-var-per-call-site note).
+// -----------------------------------------------------------------------------
+c1  = request.security(sym1,  timeframe.period, close, lookahead = barmerge.lookahead_off)
+c2  = request.security(sym2,  timeframe.period, close, lookahead = barmerge.lookahead_off)
+c3  = request.security(sym3,  timeframe.period, close, lookahead = barmerge.lookahead_off)
+c4  = request.security(sym4,  timeframe.period, close, lookahead = barmerge.lookahead_off)
+c5  = request.security(sym5,  timeframe.period, close, lookahead = barmerge.lookahead_off)
+c6  = request.security(sym6,  timeframe.period, close, lookahead = barmerge.lookahead_off)
+c7  = request.security(sym7,  timeframe.period, close, lookahead = barmerge.lookahead_off)
+c8  = request.security(sym8,  timeframe.period, close, lookahead = barmerge.lookahead_off)
+c9  = request.security(sym9,  timeframe.period, close, lookahead = barmerge.lookahead_off)
+c10 = request.security(sym10, timeframe.period, close, lookahead = barmerge.lookahead_off)
+
+f_normalize(src) =>
+    var float base = na
+    if na(base) and not na(src)
+        base := src
+    na(base) ? na : src / base
+
+n1  = f_normalize(c1)
+n2  = f_normalize(c2)
+n3  = f_normalize(c3)
+n4  = f_normalize(c4)
+n5  = f_normalize(c5)
+n6  = f_normalize(c6)
+n7  = f_normalize(c7)
+n8  = f_normalize(c8)
+n9  = f_normalize(c9)
+n10 = f_normalize(c10)
+
+basketRaw = (n1 + n2 + n3 + n4 + n5 + n6 + n7 + n8 + n9 + n10) / 10
+basket    = basketRaw * 1000
+
+singleTicker = partnerChoice == "QQQ" ? "QQQ" : partnerChoice == "ES1!" ? "ES1!" : partnerChoice == "XLK" ? "XLK" : "QQQ"
+singleClose  = request.security(singleTicker, timeframe.period, close, lookahead = barmerge.lookahead_off)
+
+partner = partnerChoice == "Equal-Weight Basket" ? basket : singleClose
+
+// -----------------------------------------------------------------------------
+// BETA / SPREAD / Z-SCORE -- identical derivation to the companion indicator.
+// -----------------------------------------------------------------------------
+logNQ      = math.log(close)
+logPartner = math.log(partner)
+
+beta   = ta.correlation(logPartner, logNQ, hedgeWindow) * ta.stdev(logPartner, hedgeWindow) / ta.stdev(logNQ, hedgeWindow)
+spread = logPartner - beta * logNQ
+zscore = (spread - ta.sma(spread, lookbackZ)) / ta.stdev(spread, lookbackZ)
+
+// One-bar lag for every trading decision -- see header NO-REPAINT DESIGN note.
+zSig = zscore[1]
+
+// -----------------------------------------------------------------------------
+// STATE MACHINE -- mirrors the companion indicator's position states, but
+// drives real strategy.entry()/strategy.close_all() orders on the NQ leg.
+// Named posState, not "position", because Pine reserves the identifier
+// `position` as a built-in namespace (position.top_right etc., used below
+// by table.new()) -- reusing it as a variable would shadow that namespace.
+// -----------------------------------------------------------------------------
+var int posState = 0   // 0 = flat, 1 = long spread (=> short NQ), -1 = short spread (=> long NQ)
+
+haveSignal = not na(zSig)
+
+longEntrySig  = haveSignal and inSegment and posState == 0 and zSig < -entryZ
+shortEntrySig = haveSignal and inSegment and posState == 0 and zSig >  entryZ
+stopSig       = haveSignal and posState != 0 and math.abs(zSig) > stopZ
+exitSig       = haveSignal and posState != 0 and not stopSig and math.abs(zSig) < exitZ
+segmentExitSig = not inSegment and posState != 0
+
+if longEntrySig
+    // Long spread = long partner, short beta*NQ -> the tradeable NQ leg is short.
+    strategy.entry("ShortNQ", strategy.short, comment = "LongSpread")
+    posState := 1
+
+if shortEntrySig
+    // Short spread = short partner, long beta*NQ -> the tradeable NQ leg is long.
+    strategy.entry("LongNQ", strategy.long, comment = "ShortSpread")
+    posState := -1
+
+if stopSig
+    strategy.close_all(comment = "Stop")
+    posState := 0
+
+if exitSig
+    strategy.close_all(comment = "Exit")
+    posState := 0
+
+if segmentExitSig
+    strategy.close_all(comment = "Segment End")
+    posState := 0
+
+// -----------------------------------------------------------------------------
+// PLOTS -- same visual layout as the companion indicator, for side-by-side
+// comparison of signal timing against the Strategy Tester's trade markers.
+// -----------------------------------------------------------------------------
+plot(zscore, title = "Z-Score", color = color.new(color.blue, 0), linewidth = 2)
+
+hline(0,        "Zero",    color = color.gray,                 linestyle = hline.style_solid)
+hline(entryZ,   "Entry +", color = color.new(color.orange, 0), linestyle = hline.style_dashed)
+hline(-entryZ,  "Entry -", color = color.new(color.orange, 0), linestyle = hline.style_dashed)
+hline(exitZ,    "Exit +",  color = color.new(color.teal, 0),   linestyle = hline.style_dotted)
+hline(-exitZ,   "Exit -",  color = color.new(color.teal, 0),   linestyle = hline.style_dotted)
+hline(stopZ,    "Stop +",  color = color.new(color.red, 0),    linestyle = hline.style_solid)
+hline(-stopZ,   "Stop -",  color = color.new(color.red, 0),    linestyle = hline.style_solid)
+
+bgCol = posState == 1 ? color.new(color.green, 90) : posState == -1 ? color.new(color.red, 90) : na
+bgcolor(showBg ? bgCol : na, title = "Position State Shading (pane)")
+bgcolor(showBg ? bgCol : na, title = "Position State Shading (chart)", force_overlay = true)
+
+// Segment window shading on the main chart, so it's obvious which bars the
+// active segment covers regardless of "All History" being selected.
+bgcolor(showBg and not inSegment ? color.new(color.gray, 95) : na, title = "Outside Active Segment", force_overlay = true)
+
+plotshape(showMarkers and longEntrySig  ? zscore : na, title = "Long Spread Entry (Short NQ)",  style = shape.triangleup,   location = location.absolute, color = color.new(color.green, 0),  size = size.small)
+plotshape(showMarkers and shortEntrySig ? zscore : na, title = "Short Spread Entry (Long NQ)",  style = shape.triangledown, location = location.absolute, color = color.new(color.red, 0),    size = size.small)
+plotshape(showMarkers and exitSig       ? zscore : na, title = "Exit to Flat",                  style = shape.xcross,       location = location.absolute, color = color.new(color.gray, 0),   size = size.small)
+plotshape(showMarkers and stopSig       ? zscore : na, title = "Stop-Out",                      style = shape.diamond,      location = location.absolute, color = color.new(color.red, 0),    size = size.normal)
+
+// -----------------------------------------------------------------------------
+// STATS TABLE -- for the authoritative trade count / win rate / net P&L per
+// segment, use the Strategy Tester's own "List of Trades" and "Performance
+// Summary" tabs (switch segmentChoice above and re-run to compare them).
+// -----------------------------------------------------------------------------
+var table infoTable = table.new(position.top_right, 2, 4, border_width = 1, force_overlay = true)
+
+if showTable and barstate.islast
+    posText = posState == 1 ? "LONG SPREAD (short NQ)" : posState == -1 ? "SHORT SPREAD (long NQ)" : "FLAT"
+    table.cell(infoTable, 0, 0, "Segment",  bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 1, 0, segmentChoice, bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 0, 1, "Z-Score",  bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 1, 1, str.tostring(zscore, "#.##"), bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 0, 2, "Beta",     bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 1, 2, str.tostring(beta, "#.####"), bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 0, 3, "Position", bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 1, 3, posText,    bgcolor = color.new(color.gray, 80), text_color = posState == 1 ? color.lime : posState == -1 ? color.red : color.white)
+
+// -----------------------------------------------------------------------------
+// ALERTS -- same four events as the companion indicator.
+// -----------------------------------------------------------------------------
+alertcondition(longEntrySig,  title = "Long Spread Entry",  message = "NQ/Basket pairs: LONG SPREAD entry (short NQ leg) on {{ticker}} {{interval}}")
+alertcondition(shortEntrySig, title = "Short Spread Entry", message = "NQ/Basket pairs: SHORT SPREAD entry (long NQ leg) on {{ticker}} {{interval}}")
+alertcondition(exitSig,       title = "Exit to Flat",       message = "NQ/Basket pairs: exit to FLAT on {{ticker}} {{interval}}")
+alertcondition(stopSig,       title = "Stop-Out",           message = "NQ/Basket pairs: STOPPED OUT on {{ticker}} {{interval}}")

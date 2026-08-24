@@ -1,0 +1,272 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//@version=5
+
+// =============================================================================
+// NQ / Mega-Cap Basket Z-Score Pairs Signal
+//
+// PINE VERSION NOTE: written against //@version=5. Pine v6 was requested as
+// the preferred target, but this environment has no live TradingView editor
+// to compile/verify v6-specific syntax against, and the existing script in
+// this repo (Momentum_ROC_Signal_ES_NQ.pine) is also v5 -- so v5 was chosen
+// as the reliable, verifiable choice. Everything here (request.security,
+// ta.*, table.*, plotshape location.absolute, force_overlay) is standard,
+// stable Pine v5 syntax that should port to v6 with little or no change if
+// you choose to upgrade the version pragma yourself.
+//
+// WHAT THIS IS: a faithful re-implementation, as a live/monitoring
+// indicator, of one specific rule from an already-completed backtest run on
+// SYNTHETIC daily data (2018-2026, train -> validate -> test methodology,
+// 5 candidate index/basket pairs tested). Of those 5 pairs, NQ vs. an
+// equal-weighted top-10 Nasdaq-100 mega-cap basket had the best win rate
+// (42.9%) and the best Sharpe ratio / profit factor -- i.e. it was the
+// *least bad* of the five. It still LOST MONEY net of transaction costs in
+// the out-of-sample test window: -6.4% return, -17.8% max drawdown.
+//
+// THIS IS NOT A PROVEN PROFITABLE STRATEGY, INCLUDING ON THIS PAIR. It is
+// published here strictly as a research / monitoring tool so the same
+// mean-reversion rule can be watched live. Treat every signal as a
+// hypothesis, not a recommendation. Paper-trade and re-validate against
+// TradingView's own historical data (which will differ from the synthetic
+// backtest data this was tuned on) before ever risking real capital, and
+// re-run the companion strategy() script (see /strategies in this repo) to
+// confirm the Train / Validation / Test performance split still resembles
+// the original result before trusting this on a live account.
+//
+// CHART CONTEXT: designed to run on NQ1! (CME Nasdaq-100 E-mini continuous
+// futures), Daily timeframe -- hedgeWindow/lookbackZ/entryZ/exitZ/stopZ were
+// all tuned on daily bars. Loading this on a different symbol or a
+// different timeframe (intraday, weekly, etc.) will produce a statistically
+// different z-score process and the default thresholds will no longer be
+// meaningful; re-tune (or at least re-validate) before relying on it
+// anywhere but NQ1! Daily.
+//
+// NO-REPAINT DESIGN: beta/spread/zscore are recomputed every bar (including
+// the live, still-forming bar), but every trading DECISION (entry, exit,
+// stop) is deliberately evaluated one bar lagged -- i.e. off zscore[1], the
+// z-score as of the *previous, fully confirmed* bar's close -- exactly like
+// a rolling-window backtest that decides on bar T's close and can only act
+// from bar T+1 onward. This means a signal, once plotted, never moves or
+// disappears on a later recalculation. The basket/partner data itself is
+// pulled with request.security(..., lookahead = barmerge.lookahead_off) for
+// the same reason.
+// =============================================================================
+indicator("NQ / Basket Z-Score Pairs Signal", shorttitle = "NQ/Basket Z", overlay = false, format = format.price)
+
+// -----------------------------------------------------------------------------
+// INPUTS
+// -----------------------------------------------------------------------------
+grpPartner = "Partner Instrument"
+grpBasket  = "Basket Constituents (used only when Partner = Equal-Weight Basket)"
+grpStrat   = "Strategy Parameters (tuned on NQ1! Daily -- see header)"
+grpDisplay = "Display"
+
+partnerChoice = input.string("Equal-Weight Basket", "Partner Instrument", options = ["Equal-Weight Basket", "QQQ", "ES1!", "XLK"], group = grpPartner, tooltip = "Equal-Weight Basket = the 10-stock index built below. Any other choice fetches that single symbol via request.security() instead and the 10-stock basket is ignored for signal purposes.")
+
+sym1  = input.symbol("AAPL",  "Constituent 1",  group = grpBasket)
+sym2  = input.symbol("MSFT",  "Constituent 2",  group = grpBasket)
+sym3  = input.symbol("NVDA",  "Constituent 3",  group = grpBasket)
+sym4  = input.symbol("AMZN",  "Constituent 4",  group = grpBasket)
+sym5  = input.symbol("META",  "Constituent 5",  group = grpBasket)
+sym6  = input.symbol("GOOGL", "Constituent 6",  group = grpBasket)
+sym7  = input.symbol("AVGO",  "Constituent 7",  group = grpBasket)
+sym8  = input.symbol("TSLA",  "Constituent 8",  group = grpBasket)
+sym9  = input.symbol("COST",  "Constituent 9",  group = grpBasket)
+sym10 = input.symbol("NFLX",  "Constituent 10", group = grpBasket)
+
+hedgeWindow = input.int(90, "Hedge Ratio Window (bars)", minval = 5, group = grpStrat, tooltip = "Rolling window used to derive the beta (hedge ratio) between log(partner) and log(NQ). Tuned as 90 daily bars -- rescale if you change timeframe.")
+lookbackZ   = input.int(90, "Z-Score Lookback (bars)", minval = 5, group = grpStrat, tooltip = "Rolling window for the spread's mean/stdev used to compute the z-score. Tuned as 90 daily bars.")
+entryZ      = input.float(2.0, "Entry Threshold |z|", minval = 0.1, step = 0.1, group = grpStrat, tooltip = "Flat -> position when |z| crosses beyond this level.")
+exitZ       = input.float(0.5, "Exit-to-Flat Threshold |z|", minval = 0.0, step = 0.1, group = grpStrat, tooltip = "Position -> flat (normal exit) once |z| falls back below this level.")
+stopZ       = input.float(3.5, "Hard Stop Threshold |z|", minval = 0.1, step = 0.1, group = grpStrat, tooltip = "Position -> flat (flagged as a STOP, not a normal exit) if |z| ever exceeds this level -- the mean-reversion premise is treated as broken.")
+
+showTable   = input.bool(true, "Show Stats Table", group = grpDisplay)
+showMarkers = input.bool(true, "Show Entry/Exit/Stop Markers", group = grpDisplay)
+showBg      = input.bool(true, "Show Position Background Shading", group = grpDisplay)
+
+// -----------------------------------------------------------------------------
+// BASKET CONSTRUCTION -- equal-weighted top-10 Nasdaq-100 mega-cap index
+// -----------------------------------------------------------------------------
+// Each constituent's daily close is pulled non-repainting (lookahead_off).
+// All 10 basket legs are always fetched, even when the user has selected a
+// non-basket partner below -- Pine's request.security() calls live at
+// global scope and are cheapest/most reliable when called unconditionally
+// every bar rather than branched on an input; 11 total security() calls
+// (10 legs + 1 single-symbol fetch) is well under Pine's per-script limit.
+c1  = request.security(sym1,  timeframe.period, close, lookahead = barmerge.lookahead_off)
+c2  = request.security(sym2,  timeframe.period, close, lookahead = barmerge.lookahead_off)
+c3  = request.security(sym3,  timeframe.period, close, lookahead = barmerge.lookahead_off)
+c4  = request.security(sym4,  timeframe.period, close, lookahead = barmerge.lookahead_off)
+c5  = request.security(sym5,  timeframe.period, close, lookahead = barmerge.lookahead_off)
+c6  = request.security(sym6,  timeframe.period, close, lookahead = barmerge.lookahead_off)
+c7  = request.security(sym7,  timeframe.period, close, lookahead = barmerge.lookahead_off)
+c8  = request.security(sym8,  timeframe.period, close, lookahead = barmerge.lookahead_off)
+c9  = request.security(sym9,  timeframe.period, close, lookahead = barmerge.lookahead_off)
+c10 = request.security(sym10, timeframe.period, close, lookahead = barmerge.lookahead_off)
+
+// Normalizes a price series to 1.0 at the first bar of data this call site
+// ever sees. Pine has no reliable way to react to pure chart pan/zoom
+// (visible range) without new data arriving, so "first bar in view" is
+// implemented as "first loaded bar" -- deterministic and repaint-free,
+// per the spec's own "(or at indicator load)" fallback. Each of the 10
+// call sites below (f_normalize(c1) .. f_normalize(c10)) keeps its own
+// independent `base`, since persistent `var` state in Pine is scoped per
+// textual call site.
+f_normalize(src) =>
+    var float base = na
+    if na(base) and not na(src)
+        base := src
+    na(base) ? na : src / base
+
+n1  = f_normalize(c1)
+n2  = f_normalize(c2)
+n3  = f_normalize(c3)
+n4  = f_normalize(c4)
+n5  = f_normalize(c5)
+n6  = f_normalize(c6)
+n7  = f_normalize(c7)
+n8  = f_normalize(c8)
+n9  = f_normalize(c9)
+n10 = f_normalize(c10)
+
+// Equal-weight average of the 10 normalized legs, rebased to start at 1000.
+basketRaw = (n1 + n2 + n3 + n4 + n5 + n6 + n7 + n8 + n9 + n10) / 10
+basket    = basketRaw * 1000
+
+// Single-symbol partner fetch, used whenever the user picks something other
+// than the basket.
+singleTicker = partnerChoice == "QQQ" ? "QQQ" : partnerChoice == "ES1!" ? "ES1!" : partnerChoice == "XLK" ? "XLK" : "QQQ"
+singleClose  = request.security(singleTicker, timeframe.period, close, lookahead = barmerge.lookahead_off)
+
+partner = partnerChoice == "Equal-Weight Basket" ? basket : singleClose
+
+// -----------------------------------------------------------------------------
+// BETA / SPREAD / Z-SCORE -- derived on log-prices of NQ (chart symbol) and partner
+// -----------------------------------------------------------------------------
+// Pine has no built-in rolling OLS, so the rolling hedge ratio (beta) is
+// derived algebraically from rolling correlation and rolling stdev:
+//   beta = corr(logPartner, logNQ) * stdev(logPartner) / stdev(logNQ)
+// which is exactly the slope coefficient of a simple OLS regression of
+// logPartner on logNQ, evaluated on a rolling window.
+logNQ      = math.log(close)
+logPartner = math.log(partner)
+
+beta = ta.correlation(logPartner, logNQ, hedgeWindow) * ta.stdev(logPartner, hedgeWindow) / ta.stdev(logNQ, hedgeWindow)
+
+// Spread = the hedged log-price differential. If partner and NQ stay
+// cointegrated, this spread should mean-revert around its own rolling mean.
+spread = logPartner - beta * logNQ
+
+// Z-score of the spread against its own rolling mean/stdev -- this is the
+// core mean-reversion signal.
+zscore = (spread - ta.sma(spread, lookbackZ)) / ta.stdev(spread, lookbackZ)
+
+// --- Lag by exactly one bar for every trading decision (see header) -------
+// zSig/betaSig/spreadSig are the values as of the previous, fully confirmed
+// bar. All entry/exit/stop logic below reads ONLY these lagged series, so a
+// decision made "on" bar T was actually knowable at the open of bar T and
+// cannot repaint intrabar.
+zSig      = zscore[1]
+spreadSig = spread[1]
+
+// -----------------------------------------------------------------------------
+// STATE MACHINE -- var int posState: 0 = flat, 1 = long spread, -1 = short spread
+// (named posState, not "position", because Pine reserves the identifier
+// `position` as a built-in namespace -- position.top_right etc. -- used just
+// below by table.new(); reusing it as a variable name would shadow that
+// namespace and break the table's position argument.)
+// -----------------------------------------------------------------------------
+// Long spread  = long partner, short beta*NQ  (entered when z falls below -entryZ)
+// Short spread = short partner, long beta*NQ  (entered when z rises above +entryZ)
+// Exit-to-flat = normal exit once |z| reverts back inside the exit band
+// Stop-out     = forced flat if |z| blows THROUGH the stop band -- the
+//                mean-reversion premise is treated as invalidated, and this
+//                is tracked/plotted separately from a normal exit.
+var int   posState      = 0
+var float entrySpread   = na
+var int   wins          = 0
+var int   losses        = 0
+var int   closedTrades  = 0
+
+haveSignal = not na(zSig)
+
+longEntrySig  = haveSignal and posState == 0 and zSig < -entryZ
+shortEntrySig = haveSignal and posState == 0 and zSig >  entryZ
+stopSig       = haveSignal and posState != 0 and math.abs(zSig) > stopZ
+exitSig       = haveSignal and posState != 0 and not stopSig and math.abs(zSig) < exitZ
+
+if longEntrySig
+    posState    := 1
+    entrySpread := spreadSig
+
+if shortEntrySig
+    posState    := -1
+    entrySpread := spreadSig
+
+if stopSig or exitSig
+    // Spread P&L: a long-spread trade profits when the spread rose from
+    // entry to exit; a short-spread trade profits when it fell.
+    tradePnl = posState == 1 ? (spreadSig - entrySpread) : (entrySpread - spreadSig)
+    if tradePnl > 0
+        wins += 1
+    else
+        losses += 1
+    closedTrades += 1
+    posState    := 0
+    entrySpread := na
+
+// -----------------------------------------------------------------------------
+// PLOTS -- z-score line + reference bands (own pane, since overlay = false)
+// -----------------------------------------------------------------------------
+plot(zscore, title = "Z-Score", color = color.new(color.blue, 0), linewidth = 2)
+
+hline(0,        "Zero",           color = color.gray,                 linestyle = hline.style_solid)
+hline(entryZ,   "Entry +",        color = color.new(color.orange, 0), linestyle = hline.style_dashed)
+hline(-entryZ,  "Entry -",        color = color.new(color.orange, 0), linestyle = hline.style_dashed)
+hline(exitZ,    "Exit +",         color = color.new(color.teal, 0),   linestyle = hline.style_dotted)
+hline(-exitZ,   "Exit -",         color = color.new(color.teal, 0),   linestyle = hline.style_dotted)
+hline(stopZ,    "Stop +",         color = color.new(color.red, 0),    linestyle = hline.style_solid)
+hline(-stopZ,   "Stop -",         color = color.new(color.red, 0),    linestyle = hline.style_solid)
+
+// -----------------------------------------------------------------------------
+// BACKGROUND SHADING -- current position state, in both the z-score pane and
+// (via force_overlay) tinted onto the main price chart too.
+// -----------------------------------------------------------------------------
+bgCol = posState == 1 ? color.new(color.green, 90) : posState == -1 ? color.new(color.red, 90) : na
+bgcolor(showBg ? bgCol : na, title = "Position State Shading (pane)")
+bgcolor(showBg ? bgCol : na, title = "Position State Shading (chart)", force_overlay = true)
+
+// -----------------------------------------------------------------------------
+// SIGNAL MARKERS -- plotted at the z-score value itself via location.absolute
+// -----------------------------------------------------------------------------
+plotshape(showMarkers and longEntrySig  ? zscore : na, title = "Long Spread Entry",  style = shape.triangleup,   location = location.absolute, color = color.new(color.green, 0),  size = size.small)
+plotshape(showMarkers and shortEntrySig ? zscore : na, title = "Short Spread Entry", style = shape.triangledown, location = location.absolute, color = color.new(color.red, 0),    size = size.small)
+plotshape(showMarkers and exitSig       ? zscore : na, title = "Exit to Flat",       style = shape.xcross,       location = location.absolute, color = color.new(color.gray, 0),   size = size.small)
+plotshape(showMarkers and stopSig       ? zscore : na, title = "Stop-Out",           style = shape.diamond,      location = location.absolute, color = color.new(color.red, 0),    size = size.normal)
+
+// -----------------------------------------------------------------------------
+// STATS TABLE -- top-right, pinned onto the main chart via force_overlay
+// -----------------------------------------------------------------------------
+var table infoTable = table.new(position.top_right, 2, 5, border_width = 1, force_overlay = true)
+
+if showTable and barstate.islast
+    posText = posState == 1 ? "LONG SPREAD" : posState == -1 ? "SHORT SPREAD" : "FLAT"
+    winRate = closedTrades > 0 ? (wins / closedTrades) * 100.0 : na
+
+    table.cell(infoTable, 0, 0, "Z-Score",       bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 1, 0, str.tostring(zscore, "#.##"), bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 0, 1, "Beta",          bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 1, 1, str.tostring(beta, "#.####"), bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 0, 2, "Position",       bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 1, 2, posText,          bgcolor = color.new(color.gray, 80), text_color = posState == 1 ? color.lime : posState == -1 ? color.red : color.white)
+    table.cell(infoTable, 0, 3, "Closed Trades",  bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 1, 3, str.tostring(closedTrades), bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 0, 4, "Win Rate",       bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 1, 4, na(winRate) ? "n/a" : str.tostring(winRate, "#.#") + "%", bgcolor = color.new(color.gray, 80), text_color = color.white)
+
+// -----------------------------------------------------------------------------
+// ALERTS
+// -----------------------------------------------------------------------------
+alertcondition(longEntrySig,  title = "Long Spread Entry",  message = "NQ/Basket pairs: LONG SPREAD entry (long partner, short beta*NQ) on {{ticker}} {{interval}}")
+alertcondition(shortEntrySig, title = "Short Spread Entry", message = "NQ/Basket pairs: SHORT SPREAD entry (short partner, long beta*NQ) on {{ticker}} {{interval}}")
+alertcondition(exitSig,       title = "Exit to Flat",       message = "NQ/Basket pairs: exit to FLAT (|z| back inside exit band) on {{ticker}} {{interval}}")
+alertcondition(stopSig,       title = "Stop-Out",           message = "NQ/Basket pairs: STOPPED OUT (|z| exceeded hard stop) on {{ticker}} {{interval}}")
