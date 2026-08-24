@@ -1,0 +1,3 @@
+//@version=5
+indicator("TEST - Blue Background", overlay = true)
+bgcolor(color.new(color.blue, 50))
