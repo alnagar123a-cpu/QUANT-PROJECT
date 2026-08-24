@@ -1,0 +1,584 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//@version=5
+
+// =============================================================================
+// NQ Trend-Aligned Liquidity Sweep + FVG Reversal [AM Killzone]
+//
+// A fully mechanical implementation of the "NQ Trend-Aligned Liquidity Sweep
+// + FVG Reversal" ruleset for NQ/MNQ futures on the 5-minute chart:
+//   1. Daily bias  = 1H 20-EMA trend/slope test, cross-checked against
+//      yesterday's close, locked once at 9:30 AM ET for the whole session.
+//   2. Liquidity levels = overnight high/low, prior-day high/low, and the
+//      live initial-balance (9:30-10:30) high/low.
+//   3. Liquidity sweep = a wick through the bias-aligned level that closes
+//      back on the other side within 3 candles.
+//   4. Fair Value Gap  = a standard 3-candle imbalance in the bias direction,
+//      forming within 5 candles of the sweep.
+//   5. Market Structure Shift = a close beyond the minor swing point that
+//      formed during the reversal move, confirming the FVG.
+//   6. Entry = a limit order at the FVG 50% midpoint, working until 11:00 AM
+//      ET; Stop = 2 ticks beyond the sweep wick; Target 1 = nearest opposing
+//      level or 2R; Target 2 = prior-day opposite extreme or 4R.
+//   7. Circuit breakers: one trade per day, no entries after 11:00 AM ET,
+//      and a 3-consecutive-losing-day pause that resumes the next Monday.
+//
+// STATUS: this is a draft ruleset assembled from documented session-liquidity
+// and ICT-style tendencies. It has NOT been backtested. Treat every signal
+// as a hypothesis to validate, not a proven edge. Not financial advice.
+//
+// NOTE ON SCOPE: economic-calendar releases (FOMC/CPI/NFP/PCE) cannot be
+// queried from Pine, so the "skip news days" rule is implemented as a
+// manual blackout-date list you maintain yourself (Step 1 inputs below).
+//
+// NOTE ON REPAINTING: overnight/prior-day/initial-balance levels update
+// live from confirmed historical data (request.security() reads the prior,
+// fully-closed bar of each higher timeframe -- never the forming one), and
+// every state-machine transition (sweep reclaim, FVG, MSS, fills, stop/
+// target hits) is gated behind barstate.isconfirmed, so a plotted signal
+// never appears and then vanishes or moves after the fact.
+//
+// NOTE ON SIMULATION: like a real ruleset, this script tracks a single
+// hypothetical trade per day using on-chart plots/labels and fires
+// TradersPost-style webhook JSON via alert() for automated execution -- it
+// is not a strategy() backtester with an equity curve. Use TradingView bar
+// replay or an offline pandas backtest (see the ruleset's validation plan)
+// before risking real capital.
+// =============================================================================
+indicator("NQ Liquidity Sweep + FVG Reversal [AM Killzone]", shorttitle = "NQ Sweep+FVG", overlay = true, max_boxes_count = 50, max_labels_count = 200, max_lines_count = 50)
+
+// -----------------------------------------------------------------------------
+// INPUTS
+// -----------------------------------------------------------------------------
+grpSess   = "Session & Timeframes"
+grpBias   = "Step 1 -- Daily Bias Filter"
+grpLevels = "Step 2 -- Liquidity Levels"
+grpSweep  = "Step 3 -- Liquidity Sweep"
+grpFVG    = "Step 4 -- Fair Value Gap"
+grpMSS    = "Step 5 -- Market Structure Shift"
+grpRisk   = "Steps 6-8 -- Entry / Stop / Targets"
+grpSize   = "Position Sizing"
+grpBrk    = "Trade Frequency & Circuit Breakers"
+grpNews   = "News Blackout"
+grpDisp   = "Display"
+
+killzoneSess = input.session("0930-1100", "AM Killzone (new entries only)", group = grpSess)
+sessTZ       = input.string("America/New_York", "Session Timezone", group = grpSess)
+onSess       = input.session("1800-0930", "Overnight Session (ON-High/Low)", group = grpSess)
+ibSess       = input.session("0930-1030", "Initial Balance Session (IB-High/Low)", group = grpSess)
+
+biasTF       = input.timeframe("60", "Bias Timeframe", group = grpBias)
+emaLen       = input.int(20, "Bias EMA Length", minval = 1, group = grpBias)
+emaLookback  = input.int(5, "EMA Slope Lookback (HTF bars)", minval = 1, group = grpBias, tooltip = "Bias requires the EMA to be higher/lower now than this many closed bars ago on the bias timeframe.")
+
+useONLevels  = input.bool(true, "Use Overnight High/Low", group = grpLevels)
+usePDLevels  = input.bool(true, "Use Prior-Day High/Low", group = grpLevels)
+useIBLevels  = input.bool(true, "Use Initial Balance High/Low", group = grpLevels)
+
+sweepTicks   = input.int(1, "Min Sweep Distance (ticks beyond level)", minval = 1, group = grpSweep)
+reclaimBars  = input.int(3, "Reclaim Within (candles, incl. sweep candle)", minval = 1, group = grpSweep)
+
+fvgMaxBars   = input.int(5, "FVG + MSS Deadline (candles after sweep)", minval = 1, group = grpFVG, tooltip = "Both the FVG and the MSS must occur within this many candles of the sweep candle, in that order, or the setup is invalidated.")
+
+swingLR      = input.int(2, "Fractal Swing Bars (each side)", minval = 1, group = grpMSS, tooltip = "A swing point requires this many bars on each side with a lower high / higher low (2 = the ruleset's 5-candle fractal).")
+
+stopBufferTicks = input.float(2, "Stop Buffer Beyond Sweep Extreme (ticks)", minval = 0, step = 0.5, group = grpRisk)
+t1RMult      = input.float(2.0, "Target 1 (R multiple, if no nearer opposing level)", minval = 0.1, group = grpRisk)
+t2RMult      = input.float(4.0, "Target 2 (R multiple, if PD opposite extreme not nearer)", minval = 0.1, group = grpRisk)
+moveToBEOnT1 = input.bool(true, "Move Stop to Breakeven on Target 1", group = grpRisk)
+
+acctEquity        = input.float(30000, "Account Equity ($)", minval = 0, group = grpSize)
+riskPct           = input.float(0.5, "Risk per Trade (%)", minval = 0.01, group = grpSize)
+pointValueOverride = input.float(-1, "Point Value Override ($, -1 = auto from symbol)", group = grpSize, tooltip = "MNQ = $2/point, NQ = $20/point. Leave at -1 to use the chart symbol's own point value.")
+orderQty          = input.int(1, "Order Quantity (contracts, for webhook payload)", minval = 1, group = grpSize)
+
+enableBreaker = input.bool(true, "Enable 3-Consecutive-Losing-Day Circuit Breaker (resumes next Monday)", group = grpBrk)
+
+newsBlackoutDates = input.string("", "News Blackout Dates (YYYY-MM-DD, comma-separated)", group = grpNews, tooltip = "Manually list FOMC/CPI/NFP/PCE dates -- Pine cannot query an economic calendar. Bias is forced to NONE on these dates.")
+
+showLevels    = input.bool(true, "Show ON/PD/IB Levels", group = grpDisp)
+showSessions  = input.bool(true, "Shade Overnight / IB / Killzone Sessions", group = grpDisp)
+showFVGBox    = input.bool(true, "Show FVG Box", group = grpDisp)
+showTable     = input.bool(true, "Show Info Table", group = grpDisp)
+
+// -----------------------------------------------------------------------------
+// HELPER FUNCTIONS
+// -----------------------------------------------------------------------------
+// Nearest opposing level ABOVE entry (for a LONG's Target 1), na-safe.
+f_nearestAbove(entry, a, b, c) =>
+    float best = na
+    if not na(a) and a > entry
+        best := a
+    if not na(b) and b > entry
+        best := na(best) ? b : math.min(best, b)
+    if not na(c) and c > entry
+        best := na(best) ? c : math.min(best, c)
+    best
+
+// Nearest opposing level BELOW entry (for a SHORT's Target 1), na-safe.
+f_nearestBelow(entry, a, b, c) =>
+    float best = na
+    if not na(a) and a < entry
+        best := a
+    if not na(b) and b < entry
+        best := na(best) ? b : math.max(best, b)
+    if not na(c) and c < entry
+        best := na(best) ? c : math.max(best, c)
+    best
+
+// Manual news-blackout check: today's date (in session TZ) against a
+// comma-separated YYYY-MM-DD list.
+f_isNewsBlackout(dateStr) =>
+    bool blackout = false
+    if str.length(dateStr) > 0
+        parts = str.split(dateStr, ",")
+        for i = 0 to array.size(parts) - 1
+            p = str.trim(array.get(parts, i))
+            if str.length(p) == 10
+                y = str.tonumber(str.substring(p, 0, 4))
+                m = str.tonumber(str.substring(p, 5, 7))
+                d = str.tonumber(str.substring(p, 8, 10))
+                if not na(y) and not na(m) and not na(d) and year(time, sessTZ) == y and month(time, sessTZ) == m and dayofmonth(time, sessTZ) == d
+                    blackout := true
+    blackout
+
+f_stateText(s) =>
+    s == 0 ? "Idle / Scanning" : s == 1 ? "Swept - awaiting reclaim" : s == 2 ? "Reclaimed - awaiting FVG" : s == 3 ? "FVG formed - awaiting MSS" : s == 4 ? "MSS confirmed - order working" : s == 5 ? "In trade" : "Done for day"
+
+// -----------------------------------------------------------------------------
+// SESSION / TIME FLAGS
+// -----------------------------------------------------------------------------
+nyHour   = hour(time, sessTZ)
+nyMinute = minute(time, sessTZ)
+
+isSessionStart = nyHour == 9 and nyMinute == 30
+isMondayStart  = isSessionStart and dayofweek(time, sessTZ) == dayofweek.monday
+
+inKillzone = not na(time(timeframe.period, killzoneSess, sessTZ))
+inON       = not na(time(timeframe.period, onSess, sessTZ))
+inIB       = not na(time(timeframe.period, ibSess, sessTZ))
+
+// -----------------------------------------------------------------------------
+// STEP 2 -- LIQUIDITY LEVELS
+// -----------------------------------------------------------------------------
+// Overnight High/Low: accumulates live from 18:00 ET (prior day) to 9:30 ET,
+// then holds its final value for the rest of the session.
+var float onHigh = na
+var float onLow  = na
+onStart = inON and not inON[1]
+if onStart
+    onHigh := high
+    onLow  := low
+else if inON
+    onHigh := math.max(onHigh, high)
+    onLow  := math.min(onLow, low)
+
+// Initial Balance High/Low: accumulates live from 9:30-10:30 ET, then holds.
+var float ibHigh = na
+var float ibLow  = na
+ibStart = inIB and not inIB[1]
+if ibStart
+    ibHigh := high
+    ibLow  := low
+else if inIB
+    ibHigh := math.max(ibHigh, high)
+    ibLow  := math.min(ibLow, low)
+
+// Prior-day High/Low/Close, read from the last fully-closed daily bar --
+// naturally non-repainting since it always lags the current forming day.
+[pdHigh, pdLow, pdClose] = request.security(syminfo.tickerid, "D", [high[1], low[1], close[1]], lookahead = barmerge.lookahead_off)
+
+// -----------------------------------------------------------------------------
+// STEP 1 -- DAILY BIAS FILTER (1H 20-EMA trend + slope, cross-checked vs PD close)
+// -----------------------------------------------------------------------------
+[htfEmaNow, htfEmaPrev, htfCloseNow] = request.security(syminfo.tickerid, biasTF, [ta.ema(close, emaLen)[1], ta.ema(close, emaLen)[emaLookback + 1], close[1]], lookahead = barmerge.lookahead_off)
+
+// -----------------------------------------------------------------------------
+// STATE (persists across bars)
+// -----------------------------------------------------------------------------
+var int    dailyBias         = 0     // 1 = long, -1 = short, 0 = no trade today
+var bool   newsBlackoutToday = false
+
+var int    seqState          = 0     // 0 idle,1 swept,2 reclaimed,3 fvg,4 order working,5 in trade,6 done
+var float  sweptLevel        = na
+var string sweptLevelName    = ""
+var int    sweepBarIdx       = na
+var float  sweepExtreme      = na
+var int    reclaimDeadlineBar = na
+var int    reclaimBarIdx     = na
+var int    fvgDeadlineBar    = na
+var float  fvgTop            = na
+var float  fvgBot            = na
+var float  fvgMid            = na
+var box    fvgBoxId          = na
+
+var float  entryPrice   = na
+var float  stopPrice    = na
+var float  target1Price = na
+var float  target2Price = na
+var bool   t1Hit         = false
+
+var int    losingStreak   = 0
+var bool   haltedThisWeek = false
+
+// Per-bar transient flags used for plots/alerts (reset every bar).
+bool longEntrySignal  = false
+bool shortEntrySignal = false
+bool longStopHit      = false
+bool shortStopHit     = false
+bool longT1Signal     = false
+bool shortT1Signal    = false
+bool longT2Signal     = false
+bool shortT2Signal    = false
+bool mssConfirmed     = false
+
+// -----------------------------------------------------------------------------
+// FRACTAL SWING TRACKING (always running -- feeds Step 5's MSS reference)
+// -----------------------------------------------------------------------------
+swH = ta.pivothigh(high, swingLR, swingLR)
+swL = ta.pivotlow(low, swingLR, swingLR)
+
+var float lastSwingHighPrice = na
+var int   lastSwingHighBar   = na
+var float lastSwingLowPrice  = na
+var int   lastSwingLowBar    = na
+
+if not na(swH)
+    lastSwingHighPrice := swH
+    lastSwingHighBar   := bar_index - swingLR
+if not na(swL)
+    lastSwingLowPrice := swL
+    lastSwingLowBar   := bar_index - swingLR
+
+// -----------------------------------------------------------------------------
+// DAY RESET -- computed once at 9:30 AM ET, held for the rest of the session
+// -----------------------------------------------------------------------------
+if isSessionStart and barstate.isconfirmed
+    if isMondayStart
+        losingStreak   := 0
+        haltedThisWeek := false
+
+    newsBlackoutToday := f_isNewsBlackout(newsBlackoutDates)
+
+    biasLongCond  = htfCloseNow > htfEmaNow and htfEmaNow > htfEmaPrev
+    biasShortCond = htfCloseNow < htfEmaNow and htfEmaNow < htfEmaPrev
+    rawBias       = biasLongCond ? 1 : biasShortCond ? -1 : 0
+    priceVsPD     = close > pdClose ? 1 : close < pdClose ? -1 : 0
+
+    dailyBias := (rawBias != 0 and rawBias == priceVsPD and not newsBlackoutToday and not haltedThisWeek) ? rawBias : 0
+
+    // Fresh day: clear all sequence/trade state.
+    seqState           := 0
+    sweptLevel          := na
+    sweptLevelName       := ""
+    sweepBarIdx          := na
+    sweepExtreme         := na
+    reclaimDeadlineBar   := na
+    reclaimBarIdx        := na
+    fvgDeadlineBar       := na
+    fvgTop               := na
+    fvgBot               := na
+    fvgMid               := na
+    entryPrice           := na
+    stopPrice            := na
+    target1Price         := na
+    target2Price         := na
+    t1Hit                := false
+
+// -----------------------------------------------------------------------------
+// STEPS 3-8 -- SWEEP -> RECLAIM -> FVG -> MSS -> ENTRY -> STOP/TARGETS
+// -----------------------------------------------------------------------------
+// Gated on barstate.isconfirmed: every transition below finalizes only once
+// its bar has actually closed, so nothing plotted here ever repaints.
+canTrade = dailyBias != 0 and not haltedThisWeek
+
+if barstate.isconfirmed and canTrade
+    if seqState == 0
+        if inKillzone
+            bool sweptOn = false
+            bool sweptIB = false
+            bool sweptPD = false
+            if dailyBias == 1
+                sweptOn := useONLevels and not na(onLow[1]) and low <= onLow[1] - sweepTicks * syminfo.mintick
+                sweptIB := useIBLevels and not na(ibLow[1]) and low <= ibLow[1] - sweepTicks * syminfo.mintick
+                sweptPD := usePDLevels and not na(pdLow[1]) and low <= pdLow[1] - sweepTicks * syminfo.mintick
+            else
+                sweptOn := useONLevels and not na(onHigh[1]) and high >= onHigh[1] + sweepTicks * syminfo.mintick
+                sweptIB := useIBLevels and not na(ibHigh[1]) and high >= ibHigh[1] + sweepTicks * syminfo.mintick
+                sweptPD := usePDLevels and not na(pdHigh[1]) and high >= pdHigh[1] + sweepTicks * syminfo.mintick
+
+            if sweptOn or sweptIB or sweptPD
+                float lvlOn = sweptOn ? (dailyBias == 1 ? onLow[1] : onHigh[1]) : na
+                float lvlIb = sweptIB ? (dailyBias == 1 ? ibLow[1] : ibHigh[1]) : na
+                float lvlPd = sweptPD ? (dailyBias == 1 ? pdLow[1] : pdHigh[1]) : na
+
+                // Tie-break: if more than one level qualifies on the same
+                // candle, take the shallowest sweep (closest to price).
+                float  chosen     = na
+                string chosenName = ""
+                if not na(lvlOn)
+                    chosen := lvlOn
+                    chosenName := "ON"
+                if not na(lvlIb) and (na(chosen) or math.abs(close - lvlIb) < math.abs(close - chosen))
+                    chosen := lvlIb
+                    chosenName := "IB"
+                if not na(lvlPd) and (na(chosen) or math.abs(close - lvlPd) < math.abs(close - chosen))
+                    chosen := lvlPd
+                    chosenName := "PD"
+
+                sweptLevel         := chosen
+                sweptLevelName     := chosenName
+                sweepBarIdx        := bar_index
+                sweepExtreme       := dailyBias == 1 ? low : high
+                reclaimDeadlineBar := bar_index + reclaimBars - 1
+                seqState           := 1
+
+                // The sweep candle itself can also be the reclaim candle.
+                if dailyBias == 1 ? close > chosen : close < chosen
+                    reclaimBarIdx  := bar_index
+                    fvgDeadlineBar := bar_index + fvgMaxBars
+                    seqState       := 2
+
+    else if seqState == 1
+        if bar_index > reclaimDeadlineBar
+            seqState := 0
+        else if (dailyBias == 1 ? close > sweptLevel : close < sweptLevel)
+            reclaimBarIdx  := bar_index
+            fvgDeadlineBar := sweepBarIdx + fvgMaxBars
+            seqState       := 2
+
+    else if seqState == 2
+        if bar_index > fvgDeadlineBar
+            seqState := 0
+        else
+            candle1Idx = bar_index - 2
+            if candle1Idx > reclaimBarIdx
+                bullFVG = dailyBias == 1 and low > high[2]
+                bearFVG = dailyBias == -1 and high < low[2]
+                if bullFVG or bearFVG
+                    if dailyBias == 1
+                        fvgBot := high[2]
+                        fvgTop := low
+                    else
+                        fvgTop := low[2]
+                        fvgBot := high
+                    fvgMid := (fvgTop + fvgBot) / 2
+                    if showFVGBox
+                        fvgBoxId := box.new(bar_index - 2, fvgTop, bar_index, fvgBot, border_color = color.new(color.blue, 40), border_width = 1, bgcolor = color.new(color.blue, 85))
+                    seqState := 3
+
+    else if seqState == 3
+        if bar_index > fvgDeadlineBar
+            seqState := 0
+        else
+            bool mssOK = false
+            if dailyBias == 1
+                mssOK := not na(lastSwingHighBar) and lastSwingHighBar > sweepBarIdx and close > lastSwingHighPrice
+            else
+                mssOK := not na(lastSwingLowBar) and lastSwingLowBar > sweepBarIdx and close < lastSwingLowPrice
+            if mssOK
+                mssConfirmed := true
+                entryPrice   := fvgMid
+                stopPrice    := dailyBias == 1 ? sweepExtreme - stopBufferTicks * syminfo.mintick : sweepExtreme + stopBufferTicks * syminfo.mintick
+                rPoints      = math.abs(entryPrice - stopPrice)
+
+                float nearOpp = na
+                if dailyBias == 1
+                    nearOpp := f_nearestAbove(entryPrice, useONLevels ? onHigh : na, useIBLevels ? ibHigh : na, usePDLevels ? pdHigh : na)
+                else
+                    nearOpp := f_nearestBelow(entryPrice, useONLevels ? onLow : na, useIBLevels ? ibLow : na, usePDLevels ? pdLow : na)
+
+                if dailyBias == 1
+                    target1Price := na(nearOpp) ? entryPrice + t1RMult * rPoints : math.min(nearOpp, entryPrice + t1RMult * rPoints)
+                    target2Price := na(pdHigh) ? entryPrice + t2RMult * rPoints : math.min(pdHigh, entryPrice + t2RMult * rPoints)
+                else
+                    target1Price := na(nearOpp) ? entryPrice - t1RMult * rPoints : math.max(nearOpp, entryPrice - t1RMult * rPoints)
+                    target2Price := na(pdLow) ? entryPrice - t2RMult * rPoints : math.max(pdLow, entryPrice - t2RMult * rPoints)
+
+                t1Hit    := false
+                seqState := 4
+
+                longEntrySignal  := dailyBias == 1
+                shortEntrySignal := dailyBias == -1
+
+    else if seqState == 4
+        filledNow = low <= entryPrice and high >= entryPrice
+        if filledNow
+            seqState := 5
+        else if not inKillzone
+            seqState := 6
+
+    else if seqState == 5
+        if dailyBias == 1
+            if not t1Hit
+                if low <= stopPrice
+                    longStopHit  := true
+                    losingStreak := losingStreak + 1
+                    if enableBreaker and losingStreak >= 3
+                        haltedThisWeek := true
+                    seqState := 6
+                else if high >= target1Price
+                    longT1Signal := true
+                    t1Hit        := true
+                    if moveToBEOnT1
+                        stopPrice := entryPrice
+            else
+                if low <= stopPrice
+                    losingStreak := 0
+                    seqState     := 6
+                else if high >= target2Price
+                    longT2Signal := true
+                    losingStreak := 0
+                    seqState     := 6
+        else
+            if not t1Hit
+                if high >= stopPrice
+                    shortStopHit := true
+                    losingStreak := losingStreak + 1
+                    if enableBreaker and losingStreak >= 3
+                        haltedThisWeek := true
+                    seqState := 6
+                else if low <= target1Price
+                    shortT1Signal := true
+                    t1Hit         := true
+                    if moveToBEOnT1
+                        stopPrice := entryPrice
+            else
+                if high >= stopPrice
+                    losingStreak := 0
+                    seqState     := 6
+                else if low <= target2Price
+                    shortT2Signal := true
+                    losingStreak  := 0
+                    seqState      := 6
+
+// -----------------------------------------------------------------------------
+// POSITION SIZING
+// -----------------------------------------------------------------------------
+pv = pointValueOverride < 0 ? syminfo.pointvalue : pointValueOverride
+stopDistPts = (na(entryPrice) or na(stopPrice)) ? na : math.abs(entryPrice - stopPrice)
+suggestedContracts = na(stopDistPts) or stopDistPts == 0 ? na : math.floor((acctEquity * riskPct / 100) / (stopDistPts * pv))
+rNow = stopDistPts
+
+// -----------------------------------------------------------------------------
+// PLOTS -- liquidity levels
+// -----------------------------------------------------------------------------
+plot(showLevels and useONLevels ? onHigh : na, "ON-High", color = color.new(color.orange, 30), style = plot.style_stepline)
+plot(showLevels and useONLevels ? onLow  : na, "ON-Low",  color = color.new(color.orange, 30), style = plot.style_stepline)
+plot(showLevels and usePDLevels ? pdHigh : na, "PD-High", color = color.new(color.purple, 30), style = plot.style_stepline)
+plot(showLevels and usePDLevels ? pdLow  : na, "PD-Low",  color = color.new(color.purple, 30), style = plot.style_stepline)
+plot(showLevels and useIBLevels ? ibHigh : na, "IB-High", color = color.new(color.teal, 20),   style = plot.style_stepline)
+plot(showLevels and useIBLevels ? ibLow  : na, "IB-Low",  color = color.new(color.teal, 20),   style = plot.style_stepline)
+
+// -----------------------------------------------------------------------------
+// PLOTS -- entry / stop / targets (bounded to the active trade only)
+// -----------------------------------------------------------------------------
+plot(seqState == 4 or seqState == 5 ? entryPrice : na, "Entry (FVG 50%)", color = color.new(color.blue, 0), style = plot.style_linebr, linewidth = 2)
+plot(seqState == 5 ? stopPrice : na, "Stop Loss", color = color.new(color.red, 0), style = plot.style_linebr, linewidth = 1)
+plot(seqState == 5 and not t1Hit ? target1Price : na, "Target 1", color = color.new(color.green, 0), style = plot.style_linebr, linewidth = 1)
+plot(seqState == 5 ? target2Price : na, "Target 2", color = color.new(color.teal, 0), style = plot.style_linebr, linewidth = 1)
+
+// -----------------------------------------------------------------------------
+// MARKERS -- sweep / MSS / entry / exits
+// -----------------------------------------------------------------------------
+sweepJustDetected = seqState == 1 and seqState[1] != 1 and bar_index == sweepBarIdx
+plotshape(sweepJustDetected and dailyBias == 1,  title = "Sweep (Long)",  style = shape.xcross, location = location.belowbar, color = color.new(color.orange, 0), size = size.tiny)
+plotshape(sweepJustDetected and dailyBias == -1, title = "Sweep (Short)", style = shape.xcross, location = location.abovebar, color = color.new(color.orange, 0), size = size.tiny)
+
+plotshape(mssConfirmed and dailyBias == 1,  title = "MSS (Long)",  style = shape.triangleup,   location = location.belowbar, color = color.new(color.lime, 0), size = size.tiny)
+plotshape(mssConfirmed and dailyBias == -1, title = "MSS (Short)", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0),  size = size.tiny)
+
+plotshape(longEntrySignal,  title = "BUY (limit working)",  text = "BUY",  style = shape.labelup,   location = location.belowbar, color = color.new(color.lime, 0), textcolor = color.black, size = size.small)
+plotshape(shortEntrySignal, title = "SELL (limit working)", text = "SELL", style = shape.labeldown, location = location.abovebar, color = color.new(color.red, 0),  textcolor = color.white, size = size.small)
+
+plotshape(longStopHit or shortStopHit, title = "Stop Hit",   text = "SL", style = shape.xcross,  location = location.absolute, color = color.new(color.red, 0), size = size.tiny)
+plotshape(longT1Signal or shortT1Signal, title = "Target 1 Hit", text = "T1", style = shape.circle, location = location.absolute, color = color.new(color.green, 0), size = size.tiny)
+plotshape(longT2Signal or shortT2Signal, title = "Target 2 Hit", text = "T2", style = shape.circle, location = location.absolute, color = color.new(color.teal, 0), size = size.tiny)
+
+// -----------------------------------------------------------------------------
+// SESSION SHADING
+// -----------------------------------------------------------------------------
+bgcolor(showSessions and inON ? color.new(color.gray, 92) : na, title = "Overnight Session")
+bgcolor(showSessions and inIB ? color.new(color.teal, 92) : na, title = "Initial Balance")
+bgcolor(showSessions and inKillzone ? color.new(color.blue, 94) : na, title = "AM Killzone")
+bgcolor(haltedThisWeek ? color.new(color.red, 88) : na, title = "Circuit Breaker Halt")
+
+// -----------------------------------------------------------------------------
+// INFO TABLE
+// -----------------------------------------------------------------------------
+var table infoTable = table.new(position.top_right, 2, 12, border_width = 1)
+
+if showTable and barstate.islast
+    biasText  = dailyBias == 1 ? "LONG" : dailyBias == -1 ? "SHORT" : "NONE"
+    biasColor = dailyBias == 1 ? color.new(color.green, 70) : dailyBias == -1 ? color.new(color.red, 70) : color.new(color.gray, 70)
+
+    table.cell(infoTable, 0, 0, "Daily Bias", text_color = color.white, bgcolor = color.new(color.gray, 40))
+    table.cell(infoTable, 1, 0, biasText, text_color = color.white, bgcolor = biasColor)
+
+    table.cell(infoTable, 0, 1, "Sequence State", text_color = color.white)
+    table.cell(infoTable, 1, 1, f_stateText(seqState), text_color = color.white)
+
+    table.cell(infoTable, 0, 2, "Swept Level", text_color = color.white)
+    table.cell(infoTable, 1, 2, seqState == 0 ? "--" : sweptLevelName + " " + str.tostring(sweptLevel, format.mintick), text_color = color.white)
+
+    table.cell(infoTable, 0, 3, "Entry (FVG 50%)", text_color = color.white)
+    table.cell(infoTable, 1, 3, na(entryPrice) ? "--" : str.tostring(entryPrice, format.mintick), text_color = color.white)
+
+    table.cell(infoTable, 0, 4, "Stop", text_color = color.white)
+    table.cell(infoTable, 1, 4, na(stopPrice) ? "--" : str.tostring(stopPrice, format.mintick), text_color = color.white)
+
+    table.cell(infoTable, 0, 5, "Target 1 / Target 2", text_color = color.white)
+    table.cell(infoTable, 1, 5, na(target1Price) ? "--" : str.tostring(target1Price, format.mintick) + " / " + str.tostring(target2Price, format.mintick), text_color = color.white)
+
+    table.cell(infoTable, 0, 6, "R (points)", text_color = color.white)
+    table.cell(infoTable, 1, 6, na(rNow) ? "--" : str.tostring(rNow, "#.##"), text_color = color.white)
+
+    table.cell(infoTable, 0, 7, "Suggested Contracts", text_color = color.white)
+    table.cell(infoTable, 1, 7, na(suggestedContracts) ? "--" : str.tostring(suggestedContracts, "#"), text_color = color.white)
+
+    table.cell(infoTable, 0, 8, "Losing Streak", text_color = color.white)
+    table.cell(infoTable, 1, 8, str.tostring(losingStreak) + (haltedThisWeek ? " (HALTED)" : ""), text_color = haltedThisWeek ? color.red : color.white)
+
+    table.cell(infoTable, 0, 9, "ON High / Low", text_color = color.white)
+    table.cell(infoTable, 1, 9, (na(onHigh) ? "--" : str.tostring(onHigh, format.mintick)) + " / " + (na(onLow) ? "--" : str.tostring(onLow, format.mintick)), text_color = color.white)
+
+    table.cell(infoTable, 0, 10, "PD High / Low", text_color = color.white)
+    table.cell(infoTable, 1, 10, (na(pdHigh) ? "--" : str.tostring(pdHigh, format.mintick)) + " / " + (na(pdLow) ? "--" : str.tostring(pdLow, format.mintick)), text_color = color.white)
+
+    table.cell(infoTable, 0, 11, "IB High / Low", text_color = color.white)
+    table.cell(infoTable, 1, 11, (na(ibHigh) ? "--" : str.tostring(ibHigh, format.mintick)) + " / " + (na(ibLow) ? "--" : str.tostring(ibLow, format.mintick)), text_color = color.white)
+
+// -----------------------------------------------------------------------------
+// ALERTS -- TradersPost-style webhook JSON, fired once per confirmed bar close
+// -----------------------------------------------------------------------------
+alertcondition(longEntrySignal,  title = "Long Entry (limit working)",  message = "NQ Sweep+FVG: BUY LIMIT {{ticker}} at {{close}}")
+alertcondition(shortEntrySignal, title = "Short Entry (limit working)", message = "NQ Sweep+FVG: SELL LIMIT {{ticker}} at {{close}}")
+alertcondition(longStopHit or shortStopHit, title = "Stop Loss Hit",  message = "NQ Sweep+FVG: stop hit on {{ticker}}")
+alertcondition(longT1Signal or shortT1Signal, title = "Target 1 Hit", message = "NQ Sweep+FVG: Target 1 hit on {{ticker}}, stop moved to breakeven")
+alertcondition(longT2Signal or shortT2Signal, title = "Target 2 Hit", message = "NQ Sweep+FVG: Target 2 hit on {{ticker}}, trade closed")
+
+// Half-size (rounded) used for the Target-1 partial exit; with a 1-contract
+// order there is nothing to scale out of, so the full stop-to-breakeven
+// management still applies but no separate partial-exit alert fires.
+halfQty = orderQty >= 2 ? math.round(orderQty / 2) : 0
+
+if longEntrySignal
+    msg = '{"ticker":"{{ticker}}","action":"buy","quantity":' + str.tostring(orderQty) + ',"type":"limit","limitPrice":' + str.tostring(entryPrice, format.mintick) + ',"timeInForce":"day","bracket":{"takeProfit":{"limitPrice":' + str.tostring(target1Price, format.mintick) + '},"stopLoss":{"stopPrice":' + str.tostring(stopPrice, format.mintick) + '}}}'
+    alert(msg, alert.freq_once_per_bar_close)
+
+if shortEntrySignal
+    msg = '{"ticker":"{{ticker}}","action":"sell","quantity":' + str.tostring(orderQty) + ',"type":"limit","limitPrice":' + str.tostring(entryPrice, format.mintick) + ',"timeInForce":"day","bracket":{"takeProfit":{"limitPrice":' + str.tostring(target1Price, format.mintick) + '},"stopLoss":{"stopPrice":' + str.tostring(stopPrice, format.mintick) + '}}}'
+    alert(msg, alert.freq_once_per_bar_close)
+
+if longT1Signal and halfQty > 0
+    msg = '{"ticker":"{{ticker}}","action":"sell","quantity":' + str.tostring(halfQty, "#") + ',"type":"market","comment":"Target1 hit - partial exit, stop to breakeven ' + str.tostring(entryPrice, format.mintick) + '"}'
+    alert(msg, alert.freq_once_per_bar_close)
+
+if shortT1Signal and halfQty > 0
+    msg = '{"ticker":"{{ticker}}","action":"buy","quantity":' + str.tostring(halfQty, "#") + ',"type":"market","comment":"Target1 hit - partial exit, stop to breakeven ' + str.tostring(entryPrice, format.mintick) + '"}'
+    alert(msg, alert.freq_once_per_bar_close)
+
+if longStopHit or longT2Signal
+    alert('{"ticker":"{{ticker}}","action":"exit"}', alert.freq_once_per_bar_close)
+
+if shortStopHit or shortT2Signal
+    alert('{"ticker":"{{ticker}}","action":"exit"}', alert.freq_once_per_bar_close)
