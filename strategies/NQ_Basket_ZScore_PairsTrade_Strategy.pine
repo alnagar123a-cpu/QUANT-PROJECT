@@ -190,10 +190,19 @@ sessionOK = timeframe.isdaily or timeframe.isweekly or timeframe.ismonthly or no
 // CLAMPED to maxTaLength: Pine's ta.* functions hard-cap how many
 // historical bars a length argument can reference at 5000 -- confirmed by
 // TradingView's own compile error on an unclamped value ("references too
-// many historical candles"). On very fine timeframes (e.g. 1-minute) this
-// means the window ends up shorter than a true 90-trading-day equivalent
-// -- still far better than the unscaled 90 raw bars, just not a full match.
-maxTaLength    = 4500
+// many historical candles"). That cap applies PER CALL, but zscore's own
+// effLookbackZ-bar window operates on `spread`, which only starts
+// producing values once `beta` (itself an effHedgeWindow-bar rolling
+// calc) first warms up -- so the z-score's REAL warm-up requirement is
+// effHedgeWindow + effLookbackZ bars of history combined, confirmed by
+// testing: beta read a valid value on a 5-minute chart while z-score
+// still showed na, because 4500+4500=9000 bars weren't yet loaded. Each
+// window is kept well under half the hard cap so the combined total stays
+// comfortably inside what's actually available. On very fine timeframes
+// (e.g. 1-minute) this means the window ends up considerably shorter than
+// a true 90-trading-day equivalent -- still far better than the unscaled
+// 90 raw bars, just not a full match.
+maxTaLength    = 2000
 minutesPerBar  = timeframe.in_seconds(timeframe.period) / 60
 barsPerRTHDay  = minutesPerBar > 0 ? math.max(1, math.round(390 / minutesPerBar)) : 1
 scaleWindows   = autoScaleWindows and not timeframe.isdaily and not timeframe.isweekly and not timeframe.ismonthly
@@ -514,10 +523,12 @@ if showTable and barstate.islast
 
     table.cell(infoTable, 0, 0, "Segment",  bgcolor = color.new(color.gray, 80), text_color = color.white)
     table.cell(infoTable, 1, 0, segmentChoice, bgcolor = color.new(color.gray, 80), text_color = color.white)
+    // na(zscore)/na(beta) show as "Warming up..." rather than the raw
+    // "NaN" that str.tostring() prints for an na float.
     table.cell(infoTable, 0, 1, "Z-Score",  bgcolor = color.new(color.gray, 80), text_color = color.white)
-    table.cell(infoTable, 1, 1, str.tostring(zscore, "#.##"), bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 1, 1, na(zscore) ? "Warming up..." : str.tostring(zscore, "#.##"), bgcolor = color.new(color.gray, 80), text_color = color.white)
     table.cell(infoTable, 0, 2, "Beta",     bgcolor = color.new(color.gray, 80), text_color = color.white)
-    table.cell(infoTable, 1, 2, str.tostring(beta, "#.####"), bgcolor = color.new(color.gray, 80), text_color = color.white)
+    table.cell(infoTable, 1, 2, na(beta) ? "Warming up..." : str.tostring(beta, "#.####"), bgcolor = color.new(color.gray, 80), text_color = color.white)
     table.cell(infoTable, 0, 3, "Position", bgcolor = color.new(color.gray, 80), text_color = color.white)
     table.cell(infoTable, 1, 3, killSwitch ? "HALTED" : posText, bgcolor = color.new(color.gray, 80), text_color = killSwitch ? color.red : posState == 1 ? color.lime : posState == -1 ? color.red : color.white)
     // Always-on prospective entry thresholds, so the table is informative
