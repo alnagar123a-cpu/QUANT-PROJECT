@@ -71,6 +71,23 @@
 // cannot place real stop orders or talk to your prop firm's platform, and a
 // live stop can still gap past its projected price -- always place a real
 // protective stop sized the same way this script suggests.
+//
+// INTRADAY ACCOMMODATION: two things specifically corrupt this signal on
+// timeframes finer than Daily, and both have an opt-out toggle below.
+// (1) The 10 basket stocks only trade NYSE/NASDAQ regular hours (09:30-
+// 16:00 ET) while NQ trades nearly 24/5, so outside RTH request.security()
+// is forward-filling a STALE stock price against a moving NQ price -- a
+// pure session-mismatch artifact, not real divergence. The RTH Session
+// Filter suppresses signal evaluation entirely outside that window. (2)
+// hedgeWindow/lookbackZ = 90 means "90 daily bars" as tuned; left
+// unscaled on intraday bars it becomes 90 bars of just a few hours,
+// nowhere near the same statistical memory. Auto-Scale Windows for
+// Intraday stretches both by the chart's estimated bars-per-RTH-day so
+// they still span roughly 90 TRADING DAYS either way. Together these fix
+// the specific failure mode that produced ~220 trades / ~18% win rate on
+// a 5-minute chart during testing -- they do NOT mean intraday entry/exit
+// threshold behavior has been separately validated, only that the two
+// most obvious sources of artifact-driven false signals are addressed.
 // =============================================================================
 indicator("NQ / Basket Z-Score Pairs Signal", shorttitle = "NQ/Basket Z", overlay = false, format = format.price)
 
@@ -80,6 +97,7 @@ indicator("NQ / Basket Z-Score Pairs Signal", shorttitle = "NQ/Basket Z", overla
 grpPartner = "Partner Instrument"
 grpBasket  = "Basket Constituents (used only when Partner = Equal-Weight Basket)"
 grpStrat   = "Strategy Parameters (tuned on NQ1! Daily -- see header)"
+grpSession = "Intraday Accommodation (only matters off the Daily chart)"
 grpRisk    = "Prop Firm Risk Management"
 grpDisplay = "Display"
 
@@ -102,6 +120,14 @@ entryZ      = input.float(2.0, "Entry Threshold |z|", minval = 0.1, step = 0.1, 
 exitZ       = input.float(0.5, "Exit-to-Flat Threshold |z|", minval = 0.0, step = 0.1, group = grpStrat, tooltip = "Position -> flat (normal exit) once |z| falls back below this level.")
 stopZ       = input.float(3.5, "Hard Stop Threshold |z|", minval = 0.1, step = 0.1, group = grpStrat, tooltip = "Position -> flat (flagged as a STOP, not a normal exit) if |z| ever exceeds this level -- the mean-reversion premise is treated as broken.")
 
+// See INTRADAY ACCOMMODATION in the header for why these exist. Both
+// default on, since off the Daily chart they fix the specific artifact
+// that produced ~220 trades / ~18% win rate during testing.
+useSessionFilter = input.bool(true, "Restrict Signals to Regular Trading Hours (NYSE)", group = grpSession, tooltip = "Ignored on the Daily chart. On intraday timeframes, only evaluates entries/exits/stops while the basket stocks are actively trading (09:30-16:00 by default) -- outside that window their price is stale/forward-filled while NQ keeps moving, which is what corrupts the spread.")
+sessionWindow     = input.session("0930-1600", "RTH Session", group = grpSession)
+sessionTZ         = input.string("America/New_York", "Session Timezone", group = grpSession)
+autoScaleWindows  = input.bool(true, "Auto-Scale Hedge/Z-Score Windows for Intraday", group = grpSession, tooltip = "Ignored on the Daily chart. Stretches Hedge Ratio Window and Z-Score Lookback by the chart's estimated bars-per-RTH-day, so '90' still spans roughly 90 TRADING DAYS of memory instead of collapsing to a few hours of 5-minute bars.")
+
 // Position sizing and a hard loss governor for a prop-firm-style account
 // where breaching a max loss / trailing drawdown limit ends the account.
 // This sizes and tracks the NQ LEG only (the actually-fundable/tradable
@@ -122,19 +148,41 @@ showBg      = input.bool(true, "Show Position Background Shading", group = grpDi
 showLevels  = input.bool(true, "Show Price Reference Bands on NQ Chart (always on, not just while in a trade)", group = grpDisplay)
 
 // -----------------------------------------------------------------------------
-// TIMEFRAME CHECK -- every default parameter (hedgeWindow, lookbackZ,
-// entryZ, exitZ, stopZ) was tuned on DAILY bars. On any other timeframe --
-// especially intraday -- the individual stock legs only update during
-// NYSE/NASDAQ regular hours while NQ trades nearly 24/5, which makes the
-// spread/z-score statistics erratic (far more trades, much worse win rate,
-// and NQ-price projections that can become numerically unstable). This is
-// disclaimed in the header, but a silent behavior change is easy to miss,
-// so it's also flagged loudly on the chart itself.
+// TIMEFRAME CHECK + INTRADAY ACCOMMODATION -- every default parameter was
+// tuned on DAILY bars. See the header's INTRADAY ACCOMMODATION note for the
+// two specific fixes applied below (RTH session filter, window rescaling).
 // -----------------------------------------------------------------------------
+// RTH session gate: on intraday timeframes, non-na only while the basket
+// stocks are actually trading. Always true on the Daily chart (each daily
+// bar already only forms from a full trading session, so the concept
+// doesn't apply there -- time()'s intraday session check isn't meaningful
+// against a daily bar's own open time).
+inRTH     = not na(time(timeframe.period, sessionWindow, sessionTZ))
+sessionOK = timeframe.isdaily or timeframe.isweekly or timeframe.ismonthly or not useSessionFilter or inRTH
+
+// Window rescaling: stretch hedgeWindow/lookbackZ by the chart's estimated
+// bars-per-RTH-day (390 minutes = one 6.5-hour NYSE session) so they still
+// span roughly the same number of TRADING DAYS as intended, not just "90
+// bars" of whatever the chart's native resolution happens to be.
+minutesPerBar  = timeframe.in_seconds(timeframe.period) / 60
+barsPerRTHDay  = minutesPerBar > 0 ? math.max(1, math.round(390 / minutesPerBar)) : 1
+scaleWindows   = autoScaleWindows and not timeframe.isdaily and not timeframe.isweekly and not timeframe.ismonthly
+effHedgeWindow = scaleWindows ? hedgeWindow * barsPerRTHDay : hedgeWindow
+effLookbackZ   = scaleWindows ? lookbackZ   * barsPerRTHDay : lookbackZ
+
+// Both intraday mitigations on = a softer informational note. Either one
+// off (or on Daily, where neither applies/matters) = no note needed if
+// Daily, or the original loud alarm if intraday and unmitigated.
+intradayAdapted = not timeframe.isdaily and useSessionFilter and autoScaleWindows
+showTfAlarm      = not timeframe.isdaily and not intradayAdapted
+
 var label tfWarnLbl = na
-if not timeframe.isdaily and barstate.islast
+if barstate.islast
     label.delete(tfWarnLbl)
-    tfWarnLbl := label.new(bar_index, na, text = "⚠ WRONG TIMEFRAME\nTuned for the DAILY chart -- current: " + timeframe.period + "\nSignals/levels here are not meaningful.", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.orange, 0), textcolor = color.black, size = size.large, force_overlay = true)
+    if showTfAlarm
+        tfWarnLbl := label.new(bar_index, na, text = "⚠ WRONG TIMEFRAME\nTuned for the DAILY chart -- current: " + timeframe.period + "\nEnable RTH Session Filter + Auto-Scale Windows\n(Intraday Accommodation group) or switch to Daily.", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.orange, 0), textcolor = color.black, size = size.large, force_overlay = true)
+    else if intradayAdapted
+        tfWarnLbl := label.new(bar_index, na, text = "ℹ INTRADAY MODE (" + timeframe.period + "): RTH-filtered, windows auto-scaled to ~" + str.tostring(effHedgeWindow) + " bars.\nStill not independently validated intraday -- see header.", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.blue, 0), textcolor = color.white, size = size.normal, force_overlay = true)
 
 // -----------------------------------------------------------------------------
 // BASKET CONSTRUCTION -- equal-weighted top-10 Nasdaq-100 mega-cap index
@@ -203,7 +251,12 @@ partner = partnerChoice == "Equal-Weight Basket" ? basket : singleClose
 logNQ      = math.log(close)
 logPartner = math.log(partner)
 
-beta = ta.correlation(logPartner, logNQ, hedgeWindow) * ta.stdev(logPartner, hedgeWindow) / ta.stdev(logNQ, hedgeWindow)
+// Uses effHedgeWindow/effLookbackZ (see TIMEFRAME CHECK + INTRADAY
+// ACCOMMODATION above), not the raw input -- on the Daily chart these are
+// identical to hedgeWindow/lookbackZ; on intraday charts with Auto-Scale
+// enabled they're stretched to span roughly the same number of trading
+// days instead of a much shorter, noisier window of raw intraday bars.
+beta = ta.correlation(logPartner, logNQ, effHedgeWindow) * ta.stdev(logPartner, effHedgeWindow) / ta.stdev(logNQ, effHedgeWindow)
 
 // Spread = the hedged log-price differential. If partner and NQ stay
 // cointegrated, this spread should mean-revert around its own rolling mean.
@@ -213,8 +266,8 @@ spread = logPartner - beta * logNQ
 // core mean-reversion signal. spreadMean/spreadStdev are named separately
 // (rather than inlined) so the NQ PRICE PROJECTION block below can reuse
 // the exact same rolling stats the z-score itself was built from.
-spreadMean  = ta.sma(spread, lookbackZ)
-spreadStdev = ta.stdev(spread, lookbackZ)
+spreadMean  = ta.sma(spread, effLookbackZ)
+spreadStdev = ta.stdev(spread, effLookbackZ)
 zscore      = (spread - spreadMean) / spreadStdev
 
 // --- Lag by exactly one bar for every trading decision (see header) -------
@@ -305,7 +358,12 @@ var int   tradeContracts = 0
 var float cumPnlUSD      = 0.0
 var bool  killSwitch     = false
 
-haveSignal = not na(zSig)
+// sessionOK (see TIMEFRAME CHECK + INTRADAY ACCOMMODATION above) gates
+// EVERY decision -- entries, exits, and stops -- so a position already
+// open when the stock market closes simply holds, untouched by the
+// artificial spread swings that stale forward-filled stock data would
+// otherwise create, until RTH resumes.
+haveSignal = not na(zSig) and sessionOK
 
 // Prospective stop distance / position size for EACH possible direction,
 // evaluated every bar with live data -- BEFORE any entry decision -- so a
