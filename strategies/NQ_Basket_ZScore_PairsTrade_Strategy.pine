@@ -123,6 +123,16 @@ segEnd = segmentChoice == "Train (2018-01-01 to 2021-12-31)"      ? trainEnd :
 inSegment = time >= segStart and time <= segEnd
 
 // -----------------------------------------------------------------------------
+// TIMEFRAME CHECK -- every default parameter was tuned on DAILY bars. See
+// the companion indicator's identical block for the full rationale (stock
+// legs vs. NQ's near-24/5 session mismatch on intraday timeframes).
+// -----------------------------------------------------------------------------
+var label tfWarnLbl = na
+if not timeframe.isdaily and barstate.islast
+    label.delete(tfWarnLbl)
+    tfWarnLbl := label.new(bar_index, na, text = "⚠ WRONG TIMEFRAME\nTuned for the DAILY chart -- current: " + timeframe.period + "\nSignals/levels here are not meaningful.", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.orange, 0), textcolor = color.black, size = size.large, force_overlay = true)
+
+// -----------------------------------------------------------------------------
 // BASKET CONSTRUCTION -- identical to the companion indicator (see its
 // comments for the "first bar in view" / persistent-var-per-call-site note).
 // -----------------------------------------------------------------------------
@@ -185,9 +195,14 @@ zSig = zscore[1]
 // z-value as an implied NQ price (see the companion indicator's identical
 // block for the full derivation/rationale). LIVE estimate, not a fixed
 // target: recomputed every bar from today's beta/spreadMean/spreadStdev.
+// GUARD: a small beta or oversized spreadStdev (e.g. on a timeframe this
+// wasn't tuned for) can blow the exponent up so math.exp() overflows toward
+// infinity. Treat any result more than 5x away from the current NQ price as
+// unreliable and return na rather than displaying a meaningless number.
 // -----------------------------------------------------------------------------
 f_impliedNQPrice(zTarget) =>
-    math.exp((logPartner - spreadMean - zTarget * spreadStdev) / beta)
+    raw = math.exp((logPartner - spreadMean - zTarget * spreadStdev) / beta)
+    raw > close / 5 and raw < close * 5 ? raw : na
 
 // -----------------------------------------------------------------------------
 // STATE MACHINE -- mirrors the companion indicator's position states, but
@@ -366,15 +381,15 @@ if showTable and barstate.islast
     // Always-on prospective entry thresholds, so the table is informative
     // even while flat (see ALWAYS-ON PRICE REFERENCE BANDS above).
     table.cell(infoTable, 0, 4, "Entry Threshold +", bgcolor = color.new(color.gray, 80), text_color = color.white)
-    table.cell(infoTable, 1, 4, str.tostring(entryHiPriceNQ, format.mintick), bgcolor = color.new(color.gray, 80), text_color = color.orange)
+    table.cell(infoTable, 1, 4, na(entryHiPriceNQ) ? "N/A" : str.tostring(entryHiPriceNQ, format.mintick), bgcolor = color.new(color.gray, 80), text_color = color.orange)
     table.cell(infoTable, 0, 5, "Entry Threshold -", bgcolor = color.new(color.gray, 80), text_color = color.white)
-    table.cell(infoTable, 1, 5, str.tostring(entryLoPriceNQ, format.mintick), bgcolor = color.new(color.gray, 80), text_color = color.orange)
+    table.cell(infoTable, 1, 5, na(entryLoPriceNQ) ? "N/A" : str.tostring(entryLoPriceNQ, format.mintick), bgcolor = color.new(color.gray, 80), text_color = color.orange)
     table.cell(infoTable, 0, 6, "Entry Price (NQ)", bgcolor = color.new(color.gray, 80), text_color = color.white)
     table.cell(infoTable, 1, 6, posState != 0 ? str.tostring(entryPriceNQ, format.mintick) : "-- (no open trade)", bgcolor = color.new(color.gray, 80), text_color = color.white)
     table.cell(infoTable, 0, 7, "Take Profit (NQ)", bgcolor = color.new(color.gray, 80), text_color = color.white)
-    table.cell(infoTable, 1, 7, posState != 0 ? str.tostring(tpPriceNQ, format.mintick) + " (est.)" : "-- (no open trade)", bgcolor = color.new(color.gray, 80), text_color = color.teal)
+    table.cell(infoTable, 1, 7, posState == 0 ? "-- (no open trade)" : na(tpPriceNQ) ? "N/A" : str.tostring(tpPriceNQ, format.mintick) + " (est.)", bgcolor = color.new(color.gray, 80), text_color = color.teal)
     table.cell(infoTable, 0, 8, "Stop Loss (NQ)", bgcolor = color.new(color.gray, 80), text_color = color.white)
-    table.cell(infoTable, 1, 8, posState != 0 ? str.tostring(slPriceNQ, format.mintick) + " (est.)" : "-- (no open trade)", bgcolor = color.new(color.gray, 80), text_color = color.red)
+    table.cell(infoTable, 1, 8, posState == 0 ? "-- (no open trade)" : na(slPriceNQ) ? "N/A" : str.tostring(slPriceNQ, format.mintick) + " (est.)", bgcolor = color.new(color.gray, 80), text_color = color.red)
 
 // -----------------------------------------------------------------------------
 // ALERTS -- same four events as the companion indicator.

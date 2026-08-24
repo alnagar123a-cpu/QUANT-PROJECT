@@ -96,6 +96,21 @@ showBg      = input.bool(true, "Show Position Background Shading", group = grpDi
 showLevels  = input.bool(true, "Show Price Reference Bands on NQ Chart (always on, not just while in a trade)", group = grpDisplay)
 
 // -----------------------------------------------------------------------------
+// TIMEFRAME CHECK -- every default parameter (hedgeWindow, lookbackZ,
+// entryZ, exitZ, stopZ) was tuned on DAILY bars. On any other timeframe --
+// especially intraday -- the individual stock legs only update during
+// NYSE/NASDAQ regular hours while NQ trades nearly 24/5, which makes the
+// spread/z-score statistics erratic (far more trades, much worse win rate,
+// and NQ-price projections that can become numerically unstable). This is
+// disclaimed in the header, but a silent behavior change is easy to miss,
+// so it's also flagged loudly on the chart itself.
+// -----------------------------------------------------------------------------
+var label tfWarnLbl = na
+if not timeframe.isdaily and barstate.islast
+    label.delete(tfWarnLbl)
+    tfWarnLbl := label.new(bar_index, na, text = "⚠ WRONG TIMEFRAME\nTuned for the DAILY chart -- current: " + timeframe.period + "\nSignals/levels here are not meaningful.", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.orange, 0), textcolor = color.black, size = size.large, force_overlay = true)
+
+// -----------------------------------------------------------------------------
 // BASKET CONSTRUCTION -- equal-weighted top-10 Nasdaq-100 mega-cap index
 // -----------------------------------------------------------------------------
 // Each constituent's daily close is pulled non-repainting (lookahead_off).
@@ -199,8 +214,16 @@ spreadSig = spread[1]
 // price will drift over the life of a trade. That's intentional -- a frozen
 // snapshot would quietly drift out of sync with the actual, live z-score
 // condition that really triggers the exit/stop.
+//
+// GUARD: when beta is small (or spreadStdev is large relative to it, which
+// happens on timeframes/data this wasn't tuned for -- see the TIMEFRAME
+// CHECK below), the exponent can blow up and math.exp() overflows toward
+// (+/-)infinity. Instead of silently plotting/displaying a meaningless huge
+// number, treat any result more than 5x away from the current NQ price as
+// unreliable and return na (which simply doesn't plot / shows blank).
 f_impliedNQPrice(zTarget) =>
-    math.exp((logPartner - spreadMean - zTarget * spreadStdev) / beta)
+    raw = math.exp((logPartner - spreadMean - zTarget * spreadStdev) / beta)
+    raw > close / 5 and raw < close * 5 ? raw : na
 
 // -----------------------------------------------------------------------------
 // STATE MACHINE -- var int posState: 0 = flat, 1 = long spread, -1 = short spread
@@ -401,15 +424,15 @@ if showTable and barstate.islast
     // Always-on prospective entry thresholds (see ALWAYS-ON PRICE REFERENCE
     // BANDS above), so the table is informative even while flat.
     table.cell(infoTable, 0, 3, "Entry Threshold +", bgcolor = color.new(color.gray, 80), text_color = color.white)
-    table.cell(infoTable, 1, 3, str.tostring(entryHiPriceNQ, format.mintick), bgcolor = color.new(color.gray, 80), text_color = color.orange)
+    table.cell(infoTable, 1, 3, na(entryHiPriceNQ) ? "N/A" : str.tostring(entryHiPriceNQ, format.mintick), bgcolor = color.new(color.gray, 80), text_color = color.orange)
     table.cell(infoTable, 0, 4, "Entry Threshold -", bgcolor = color.new(color.gray, 80), text_color = color.white)
-    table.cell(infoTable, 1, 4, str.tostring(entryLoPriceNQ, format.mintick), bgcolor = color.new(color.gray, 80), text_color = color.orange)
+    table.cell(infoTable, 1, 4, na(entryLoPriceNQ) ? "N/A" : str.tostring(entryLoPriceNQ, format.mintick), bgcolor = color.new(color.gray, 80), text_color = color.orange)
     table.cell(infoTable, 0, 5, "Entry Price (NQ)", bgcolor = color.new(color.gray, 80), text_color = color.white)
     table.cell(infoTable, 1, 5, posState != 0 ? str.tostring(entryPriceNQ, format.mintick) : "-- (no open trade)", bgcolor = color.new(color.gray, 80), text_color = color.white)
     table.cell(infoTable, 0, 6, "Take Profit (NQ)", bgcolor = color.new(color.gray, 80), text_color = color.white)
-    table.cell(infoTable, 1, 6, posState != 0 ? str.tostring(tpPriceNQ, format.mintick) + " (est.)" : "-- (no open trade)", bgcolor = color.new(color.gray, 80), text_color = color.teal)
+    table.cell(infoTable, 1, 6, posState == 0 ? "-- (no open trade)" : na(tpPriceNQ) ? "N/A" : str.tostring(tpPriceNQ, format.mintick) + " (est.)", bgcolor = color.new(color.gray, 80), text_color = color.teal)
     table.cell(infoTable, 0, 7, "Stop Loss (NQ)", bgcolor = color.new(color.gray, 80), text_color = color.white)
-    table.cell(infoTable, 1, 7, posState != 0 ? str.tostring(slPriceNQ, format.mintick) + " (est.)" : "-- (no open trade)", bgcolor = color.new(color.gray, 80), text_color = color.red)
+    table.cell(infoTable, 1, 7, posState == 0 ? "-- (no open trade)" : na(slPriceNQ) ? "N/A" : str.tostring(slPriceNQ, format.mintick) + " (est.)", bgcolor = color.new(color.gray, 80), text_color = color.red)
     table.cell(infoTable, 0, 8, "Closed Trades",  bgcolor = color.new(color.gray, 80), text_color = color.white)
     table.cell(infoTable, 1, 8, str.tostring(closedTrades), bgcolor = color.new(color.gray, 80), text_color = color.white)
     table.cell(infoTable, 0, 9, "Win Rate",       bgcolor = color.new(color.gray, 80), text_color = color.white)
