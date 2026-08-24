@@ -175,6 +175,20 @@ zSig = zscore[1]
 // -----------------------------------------------------------------------------
 var int posState = 0   // 0 = flat, 1 = long spread (=> short NQ), -1 = short spread (=> long NQ)
 
+// Entry / take-profit / stop-loss levels for the open trade, in z-score
+// units -- see the companion indicator's identical comment for why not an
+// NQ dollar price (beta and the spread's rolling mean/stdev shift every
+// bar, so a fixed price target/stop isn't well-defined here). These are
+// display-only: the actual orders below are still driven by stopSig/exitSig
+// (the confirmed z-score crossing the stop/exit band), not by price
+// crossing these levels.
+var float entryLevel = na
+var float tpLevel     = na
+var float slLevel     = na
+var label entryLbl    = na
+var label tpLbl        = na
+var label slLbl        = na
+
 haveSignal = not na(zSig)
 
 longEntrySig  = haveSignal and inSegment and posState == 0 and zSig < -entryZ
@@ -186,12 +200,24 @@ segmentExitSig = not inSegment and posState != 0
 if longEntrySig
     // Long spread = long partner, short beta*NQ -> the tradeable NQ leg is short.
     strategy.entry("ShortNQ", strategy.short, comment = "LongSpread")
-    posState := 1
+    posState    := 1
+    entryLevel  := zSig
+    tpLevel     := -exitZ
+    slLevel     := -stopZ
+    entryLbl := label.new(bar_index, zSig,   text = "ENTRY " + str.tostring(zSig, "#.##"), style = label.style_triangleup,  yloc = yloc.price, color = color.new(color.green, 0), textcolor = color.white, size = size.small)
+    tpLbl    := label.new(bar_index, tpLevel, text = "TP " + str.tostring(tpLevel, "#.##"), style = label.style_label_left, color = color.new(color.teal, 20), textcolor = color.white, size = size.tiny)
+    slLbl    := label.new(bar_index, slLevel, text = "SL " + str.tostring(slLevel, "#.##"), style = label.style_label_left, color = color.new(color.red, 20),  textcolor = color.white, size = size.tiny)
 
 if shortEntrySig
     // Short spread = short partner, long beta*NQ -> the tradeable NQ leg is long.
     strategy.entry("LongNQ", strategy.long, comment = "ShortSpread")
-    posState := -1
+    posState    := -1
+    entryLevel  := zSig
+    tpLevel     := exitZ
+    slLevel     := stopZ
+    entryLbl := label.new(bar_index, zSig,   text = "ENTRY " + str.tostring(zSig, "#.##"), style = label.style_triangledown, yloc = yloc.price, color = color.new(color.red, 0),  textcolor = color.white, size = size.small)
+    tpLbl    := label.new(bar_index, tpLevel, text = "TP " + str.tostring(tpLevel, "#.##"), style = label.style_label_left,  color = color.new(color.teal, 20), textcolor = color.white, size = size.tiny)
+    slLbl    := label.new(bar_index, slLevel, text = "SL " + str.tostring(slLevel, "#.##"), style = label.style_label_left,  color = color.new(color.red, 20),  textcolor = color.white, size = size.tiny)
 
 if stopSig
     strategy.close_all(comment = "Stop")
@@ -204,6 +230,17 @@ if exitSig
 if segmentExitSig
     strategy.close_all(comment = "Segment End")
     posState := 0
+
+if stopSig or exitSig or segmentExitSig
+    entryLevel := na
+    tpLevel    := na
+    slLevel    := na
+    label.delete(entryLbl)
+    label.delete(tpLbl)
+    label.delete(slLbl)
+    entryLbl := na
+    tpLbl    := na
+    slLbl    := na
 
 // -----------------------------------------------------------------------------
 // PLOTS -- same visual layout as the companion indicator, for side-by-side
@@ -218,6 +255,13 @@ hline(exitZ,    "Exit +",  color = color.new(color.teal, 0),   linestyle = hline
 hline(-exitZ,   "Exit -",  color = color.new(color.teal, 0),   linestyle = hline.style_dotted)
 hline(stopZ,    "Stop +",  color = color.new(color.red, 0),    linestyle = hline.style_solid)
 hline(-stopZ,   "Stop -",  color = color.new(color.red, 0),    linestyle = hline.style_solid)
+
+// Open-trade entry / take-profit / stop-loss levels (z-score units -- see
+// the state-machine comment above). style_linebr breaks the line once the
+// value goes na, so each trade gets its own bounded pair of levels.
+plot(posState != 0 ? entryLevel : na, title = "Entry Level (z)",       color = color.new(color.gray, 40), style = plot.style_linebr, linewidth = 1)
+plot(posState != 0 ? tpLevel    : na, title = "Take Profit Level (z)", color = color.new(color.teal, 0),  style = plot.style_linebr, linewidth = 2)
+plot(posState != 0 ? slLevel    : na, title = "Stop Loss Level (z)",   color = color.new(color.red, 0),   style = plot.style_linebr, linewidth = 2)
 
 bgCol = posState == 1 ? color.new(color.green, 90) : posState == -1 ? color.new(color.red, 90) : na
 bgcolor(showBg ? bgCol : na, title = "Position State Shading (pane)")

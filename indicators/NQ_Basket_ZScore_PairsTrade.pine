@@ -187,6 +187,21 @@ var int   wins          = 0
 var int   losses        = 0
 var int   closedTrades  = 0
 
+// Entry / take-profit / stop-loss levels for the CURRENTLY OPEN trade, in
+// z-score units. Z-score units, not an NQ dollar price, because that's the
+// actual variable this strategy trades against -- beta and the spread's
+// rolling mean/stdev shift every bar, so a fixed NQ price target/stop isn't
+// well-defined the way a simple ATR offset would be. Take-profit is the
+// near edge of the exit band (where the spread has reverted as expected);
+// stop-loss is the stop band (where the spread has instead blown further
+// against the trade).
+var float entryLevel = na
+var float tpLevel     = na
+var float slLevel     = na
+var label entryLbl    = na
+var label tpLbl        = na
+var label slLbl        = na
+
 haveSignal = not na(zSig)
 
 longEntrySig  = haveSignal and posState == 0 and zSig < -entryZ
@@ -197,10 +212,22 @@ exitSig       = haveSignal and posState != 0 and not stopSig and math.abs(zSig) 
 if longEntrySig
     posState    := 1
     entrySpread := spreadSig
+    entryLevel  := zSig
+    tpLevel     := -exitZ
+    slLevel     := -stopZ
+    entryLbl := label.new(bar_index, zSig,   text = "ENTRY " + str.tostring(zSig, "#.##"), style = label.style_triangleup,  yloc = yloc.price, color = color.new(color.green, 0), textcolor = color.white, size = size.small)
+    tpLbl    := label.new(bar_index, tpLevel, text = "TP " + str.tostring(tpLevel, "#.##"), style = label.style_label_left, color = color.new(color.teal, 20), textcolor = color.white, size = size.tiny)
+    slLbl    := label.new(bar_index, slLevel, text = "SL " + str.tostring(slLevel, "#.##"), style = label.style_label_left, color = color.new(color.red, 20),  textcolor = color.white, size = size.tiny)
 
 if shortEntrySig
     posState    := -1
     entrySpread := spreadSig
+    entryLevel  := zSig
+    tpLevel     := exitZ
+    slLevel     := stopZ
+    entryLbl := label.new(bar_index, zSig,   text = "ENTRY " + str.tostring(zSig, "#.##"), style = label.style_triangledown, yloc = yloc.price, color = color.new(color.red, 0),  textcolor = color.white, size = size.small)
+    tpLbl    := label.new(bar_index, tpLevel, text = "TP " + str.tostring(tpLevel, "#.##"), style = label.style_label_left,  color = color.new(color.teal, 20), textcolor = color.white, size = size.tiny)
+    slLbl    := label.new(bar_index, slLevel, text = "SL " + str.tostring(slLevel, "#.##"), style = label.style_label_left,  color = color.new(color.red, 20),  textcolor = color.white, size = size.tiny)
 
 if stopSig or exitSig
     // Spread P&L: a long-spread trade profits when the spread rose from
@@ -213,6 +240,15 @@ if stopSig or exitSig
     closedTrades += 1
     posState    := 0
     entrySpread := na
+    entryLevel  := na
+    tpLevel     := na
+    slLevel     := na
+    label.delete(entryLbl)
+    label.delete(tpLbl)
+    label.delete(slLbl)
+    entryLbl := na
+    tpLbl    := na
+    slLbl    := na
 
 // -----------------------------------------------------------------------------
 // PLOTS -- z-score line + reference bands (own pane, since overlay = false)
@@ -226,6 +262,18 @@ hline(exitZ,    "Exit +",         color = color.new(color.teal, 0),   linestyle 
 hline(-exitZ,   "Exit -",         color = color.new(color.teal, 0),   linestyle = hline.style_dotted)
 hline(stopZ,    "Stop +",         color = color.new(color.red, 0),    linestyle = hline.style_solid)
 hline(-stopZ,   "Stop -",         color = color.new(color.red, 0),    linestyle = hline.style_solid)
+
+// -----------------------------------------------------------------------------
+// OPEN-TRADE ENTRY / TAKE-PROFIT / STOP-LOSS LEVELS
+// -----------------------------------------------------------------------------
+// Step-lines that trace the current trade's TP/SL bands (z-score units --
+// see the state-machine comment above for why not an NQ dollar price).
+// plot.style_linebr breaks the line whenever the value is na, so each trade
+// gets its own clearly bounded pair of levels that vanish once flat again --
+// same convention as the SL/TP plots in Momentum_ROC_Signal_ES_NQ.pine.
+plot(posState != 0 ? entryLevel : na, title = "Entry Level (z)",       color = color.new(color.gray, 40), style = plot.style_linebr, linewidth = 1)
+plot(posState != 0 ? tpLevel    : na, title = "Take Profit Level (z)", color = color.new(color.teal, 0),  style = plot.style_linebr, linewidth = 2)
+plot(posState != 0 ? slLevel    : na, title = "Stop Loss Level (z)",   color = color.new(color.red, 0),   style = plot.style_linebr, linewidth = 2)
 
 // -----------------------------------------------------------------------------
 // BACKGROUND SHADING -- current position state, in both the z-score pane and
