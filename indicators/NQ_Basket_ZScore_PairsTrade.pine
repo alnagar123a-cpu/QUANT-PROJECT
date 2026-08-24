@@ -88,6 +88,13 @@
 // a 5-minute chart during testing -- they do NOT mean intraday entry/exit
 // threshold behavior has been separately validated, only that the two
 // most obvious sources of artifact-driven false signals are addressed.
+//
+// TRADE HISTORY: a second table (bottom-right) logs the last N closed
+// trades (direction, entry/exit price, $ P&L, win/loss/stop), most recent
+// first -- an indicator has no native "List of Trades" tab the way a
+// strategy() does, so this rolling log is built manually from an array.
+// The companion strategy file gets the authoritative version of this for
+// free via TradingView's own Strategy Tester panel.
 // =============================================================================
 indicator("NQ / Basket Z-Score Pairs Signal", shorttitle = "NQ/Basket Z", overlay = false, format = format.price)
 
@@ -146,6 +153,8 @@ showTable   = input.bool(true, "Show Stats Table", group = grpDisplay)
 showMarkers = input.bool(true, "Show Entry/Exit/Stop Markers", group = grpDisplay)
 showBg      = input.bool(true, "Show Position Background Shading", group = grpDisplay)
 showLevels  = input.bool(true, "Show Price Reference Bands on NQ Chart (always on, not just while in a trade)", group = grpDisplay)
+showHistory = input.bool(true, "Show Trade History Table", group = grpDisplay)
+historyRows = input.int(10, "Trade History Rows (most recent first)", minval = 1, maxval = 20, group = grpDisplay)
 
 // -----------------------------------------------------------------------------
 // TIMEFRAME CHECK + INTRADAY ACCOMMODATION -- every default parameter was
@@ -375,6 +384,17 @@ var int   tradeContracts = 0
 var float cumPnlUSD      = 0.0
 var bool  killSwitch     = false
 
+// Rolling trade history log (see TRADE HISTORY TABLE below): the last
+// `historyRows` closed trades, oldest dropped via array.shift() once the
+// cap is exceeded. Declared with `var` so the arrays persist and mutate
+// across bars rather than being recreated (and emptied) every bar.
+var array<string> histDir       = array.new_string(0)
+var array<float>  histEntryPx   = array.new_float(0)
+var array<float>  histExitPx    = array.new_float(0)
+var array<int>    histContracts = array.new_int(0)
+var array<float>  histPnlUSD    = array.new_float(0)
+var array<string> histResult    = array.new_string(0)
+
 // sessionOK (see TIMEFRAME CHECK + INTRADAY ACCOMMODATION above) gates
 // EVERY decision -- entries, exits, and stops -- so a position already
 // open when the stock market closes simply holds, untouched by the
@@ -445,8 +465,26 @@ if stopSig or exitSig
     // is LONG, so it profits when NQ price RISES.
     exitPriceNQ = close
     pnlPts = posState == 1 ? (entryPriceNQ - exitPriceNQ) : (exitPriceNQ - entryPriceNQ)
-    cumPnlUSD += pnlPts * pointValue * tradeContracts
+    tradePnlUSD = pnlPts * pointValue * tradeContracts
+    cumPnlUSD += tradePnlUSD
     killSwitch := killSwitch or (cumPnlUSD <= -maxLossUSD)
+
+    // Log this trade into the rolling history (see TRADE HISTORY TABLE
+    // below) before the fields below get reset to na/0.
+    array.push(histDir, posState == 1 ? "Long" : "Short")
+    array.push(histEntryPx, entryPriceNQ)
+    array.push(histExitPx, exitPriceNQ)
+    array.push(histContracts, tradeContracts)
+    array.push(histPnlUSD, tradePnlUSD)
+    array.push(histResult, stopSig ? "STOP" : (tradePnlUSD > 0 ? "WIN" : "LOSS"))
+    if array.size(histDir) > historyRows
+        array.shift(histDir)
+        array.shift(histEntryPx)
+        array.shift(histExitPx)
+        array.shift(histContracts)
+        array.shift(histPnlUSD)
+        array.shift(histResult)
+
     posState       := 0
     entrySpread    := na
     entryLevel     := na
@@ -604,6 +642,48 @@ if showTable and barstate.islast
     table.cell(infoTable, 1, 11, str.tostring(closedTrades), bgcolor = color.new(color.gray, 80), text_color = color.white)
     table.cell(infoTable, 0, 12, "Win Rate",       bgcolor = color.new(color.gray, 80), text_color = color.white)
     table.cell(infoTable, 1, 12, na(winRate) ? "n/a" : str.tostring(winRate, "#.#") + "%", bgcolor = color.new(color.gray, 80), text_color = color.white)
+
+// -----------------------------------------------------------------------------
+// TRADE HISTORY TABLE -- bottom-right (opposite corner from the stats
+// table above), pinned onto the main chart via force_overlay. Shows the
+// last `historyRows` closed trades, most recent first, from the rolling
+// log built up in the state machine's closing block. Green background =
+// winning trade, red = losing trade or stop-out (labeled distinctly).
+// -----------------------------------------------------------------------------
+var table historyTable = table.new(position.bottom_right, 6, historyRows + 1, border_width = 1, force_overlay = true)
+
+if showHistory and barstate.islast
+    table.cell(historyTable, 0, 0, "#",       bgcolor = color.new(color.gray, 60), text_color = color.white)
+    table.cell(historyTable, 1, 0, "Dir",     bgcolor = color.new(color.gray, 60), text_color = color.white)
+    table.cell(historyTable, 2, 0, "Qty",     bgcolor = color.new(color.gray, 60), text_color = color.white)
+    table.cell(historyTable, 3, 0, "Entry",   bgcolor = color.new(color.gray, 60), text_color = color.white)
+    table.cell(historyTable, 4, 0, "Exit",    bgcolor = color.new(color.gray, 60), text_color = color.white)
+    table.cell(historyTable, 5, 0, "P&L ($)", bgcolor = color.new(color.gray, 60), text_color = color.white)
+
+    histCount = array.size(histDir)
+    for i = 0 to historyRows - 1
+        rowIdx = histCount - 1 - i  // most recent trade first
+        if rowIdx >= 0
+            dir       = array.get(histDir, rowIdx)
+            qty       = array.get(histContracts, rowIdx)
+            entryPx   = array.get(histEntryPx, rowIdx)
+            exitPx    = array.get(histExitPx, rowIdx)
+            pnlUSD    = array.get(histPnlUSD, rowIdx)
+            result    = array.get(histResult, rowIdx)
+            rowColor = result == "STOP" ? color.new(color.red, 65) : pnlUSD > 0 ? color.new(color.green, 80) : color.new(color.red, 80)
+            table.cell(historyTable, 0, i + 1, str.tostring(rowIdx + 1),          bgcolor = rowColor, text_color = color.white)
+            table.cell(historyTable, 1, i + 1, dir,                              bgcolor = rowColor, text_color = color.white)
+            table.cell(historyTable, 2, i + 1, str.tostring(qty),                bgcolor = rowColor, text_color = color.white)
+            table.cell(historyTable, 3, i + 1, str.tostring(entryPx, format.mintick), bgcolor = rowColor, text_color = color.white)
+            table.cell(historyTable, 4, i + 1, str.tostring(exitPx, format.mintick),  bgcolor = rowColor, text_color = color.white)
+            table.cell(historyTable, 5, i + 1, (pnlUSD >= 0 ? "+$" : "-$") + str.tostring(math.abs(pnlUSD), "#.##") + (result == "STOP" ? " STOP" : ""), bgcolor = rowColor, text_color = color.white)
+        else
+            table.cell(historyTable, 0, i + 1, "", bgcolor = color.new(color.gray, 90), text_color = color.white)
+            table.cell(historyTable, 1, i + 1, "", bgcolor = color.new(color.gray, 90), text_color = color.white)
+            table.cell(historyTable, 2, i + 1, "", bgcolor = color.new(color.gray, 90), text_color = color.white)
+            table.cell(historyTable, 3, i + 1, "", bgcolor = color.new(color.gray, 90), text_color = color.white)
+            table.cell(historyTable, 4, i + 1, "", bgcolor = color.new(color.gray, 90), text_color = color.white)
+            table.cell(historyTable, 5, i + 1, "", bgcolor = color.new(color.gray, 90), text_color = color.white)
 
 // -----------------------------------------------------------------------------
 // ALERTS

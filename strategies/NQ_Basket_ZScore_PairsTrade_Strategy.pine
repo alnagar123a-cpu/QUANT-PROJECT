@@ -89,6 +89,12 @@
 // produced ~220 trades / ~18% win rate on a 5-minute chart during testing
 // -- they do NOT mean intraday threshold behavior has been independently
 // validated, only that the two most obvious artifact sources are addressed.
+//
+// TRADE HISTORY: a second on-chart table (bottom-right) logs the last N
+// closed trades as a convenience. For the AUTHORITATIVE trade list --
+// every trade, full precision, exportable -- use TradingView's own
+// Strategy Tester panel's "List of Trades" tab instead; it comes free
+// with any strategy() script and needs no code here to populate.
 // =============================================================================
 strategy("NQ / Basket Z-Score Pairs Strategy [NQ leg]", shorttitle = "NQ/Basket Z Strat", overlay = false, initial_capital = 100000, currency = currency.USD, default_qty_type = strategy.fixed, default_qty_value = 1, commission_type = strategy.commission.cash_per_contract, commission_value = 2.0, slippage = 2, process_orders_on_close = true, calc_on_every_tick = false)
 
@@ -168,6 +174,12 @@ showTable   = input.bool(true, "Show Stats Table", group = grpDisplay)
 showMarkers = input.bool(true, "Show Entry/Exit/Stop Markers", group = grpDisplay)
 showBg      = input.bool(true, "Show Position Background Shading", group = grpDisplay)
 showLevels  = input.bool(true, "Show Price Reference Bands on NQ Chart (always on, not just while in a trade)", group = grpDisplay)
+// For the AUTHORITATIVE trade list (all trades, full precision, exportable),
+// use TradingView's own Strategy Tester panel -> "List of Trades" tab --
+// this on-chart table is just a convenience so you don't have to switch
+// panels to see recent trades at a glance.
+showHistory = input.bool(true, "Show Trade History Table", group = grpDisplay)
+historyRows = input.int(10, "Trade History Rows (most recent first)", minval = 1, maxval = 20, group = grpDisplay)
 
 segStart = segmentChoice == "Train (2018-01-01 to 2021-12-31)"      ? trainStart :
      segmentChoice == "Validation (2022-01-01 to 2023-12-31)" ? valStart   :
@@ -335,6 +347,16 @@ var int   tradeContracts = 0
 var float cumPnlUSD      = 0.0
 var bool  killSwitch     = false
 
+// Rolling on-chart trade history log -- see the companion indicator's
+// identical comment. For the authoritative version, use TradingView's own
+// Strategy Tester "List of Trades" tab instead (real, exportable, exact).
+var array<string> histDir       = array.new_string(0)
+var array<float>  histEntryPx   = array.new_float(0)
+var array<float>  histExitPx    = array.new_float(0)
+var array<int>    histContracts = array.new_int(0)
+var array<float>  histPnlUSD    = array.new_float(0)
+var array<string> histResult    = array.new_string(0)
+
 // sessionOK (see TIMEFRAME CHECK + INTRADAY ACCOMMODATION above) gates
 // EVERY decision -- entries, exits, and stops -- so a position already
 // open when the stock market closes simply holds, untouched by the
@@ -415,8 +437,26 @@ if stopSig or exitSig or segmentExitSig
     // by the individual stop/exit/segment-end blocks above this one.
     exitPriceNQ = close
     pnlPts = closingPosState == 1 ? (entryPriceNQ - exitPriceNQ) : (exitPriceNQ - entryPriceNQ)
-    cumPnlUSD += pnlPts * pointValue * tradeContracts
+    tradePnlUSD = pnlPts * pointValue * tradeContracts
+    cumPnlUSD += tradePnlUSD
     killSwitch := killSwitch or (cumPnlUSD <= -maxLossUSD)
+
+    // Log this trade into the rolling on-chart history (see TRADE HISTORY
+    // TABLE below) before entryPriceNQ/tradeContracts reset below.
+    array.push(histDir, closingPosState == 1 ? "Long" : "Short")
+    array.push(histEntryPx, entryPriceNQ)
+    array.push(histExitPx, exitPriceNQ)
+    array.push(histContracts, tradeContracts)
+    array.push(histPnlUSD, tradePnlUSD)
+    array.push(histResult, stopSig ? "STOP" : (tradePnlUSD > 0 ? "WIN" : "LOSS"))
+    if array.size(histDir) > historyRows
+        array.shift(histDir)
+        array.shift(histEntryPx)
+        array.shift(histExitPx)
+        array.shift(histContracts)
+        array.shift(histPnlUSD)
+        array.shift(histResult)
+
     entryLevel     := na
     tpLevel        := na
     slLevel        := na
@@ -552,6 +592,47 @@ if showTable and barstate.islast
     table.cell(infoTable, 1, 11, killSwitch ? "$0 -- HALTED" : "$" + str.tostring(budgetLeftUSD, "#.##"), bgcolor = riskTableColor, text_color = killSwitch ? color.red : color.white)
     table.cell(infoTable, 0, 12, "Point Value", bgcolor = color.new(color.gray, 80), text_color = color.white)
     table.cell(infoTable, 1, 12, "$" + str.tostring(pointValue, "#.##") + "/pt (" + syminfo.ticker + ")", bgcolor = color.new(color.gray, 80), text_color = color.white)
+
+// -----------------------------------------------------------------------------
+// TRADE HISTORY TABLE -- bottom-right, on-chart convenience log of the
+// last `historyRows` closed trades (see the companion indicator's
+// identical block). For the authoritative, exact, exportable trade list,
+// use TradingView's own Strategy Tester panel -> "List of Trades" tab.
+// -----------------------------------------------------------------------------
+var table historyTable = table.new(position.bottom_right, 6, historyRows + 1, border_width = 1, force_overlay = true)
+
+if showHistory and barstate.islast
+    table.cell(historyTable, 0, 0, "#",       bgcolor = color.new(color.gray, 60), text_color = color.white)
+    table.cell(historyTable, 1, 0, "Dir",     bgcolor = color.new(color.gray, 60), text_color = color.white)
+    table.cell(historyTable, 2, 0, "Qty",     bgcolor = color.new(color.gray, 60), text_color = color.white)
+    table.cell(historyTable, 3, 0, "Entry",   bgcolor = color.new(color.gray, 60), text_color = color.white)
+    table.cell(historyTable, 4, 0, "Exit",    bgcolor = color.new(color.gray, 60), text_color = color.white)
+    table.cell(historyTable, 5, 0, "P&L ($)", bgcolor = color.new(color.gray, 60), text_color = color.white)
+
+    histCount = array.size(histDir)
+    for i = 0 to historyRows - 1
+        rowIdx = histCount - 1 - i  // most recent trade first
+        if rowIdx >= 0
+            dir     = array.get(histDir, rowIdx)
+            qty     = array.get(histContracts, rowIdx)
+            entryPx = array.get(histEntryPx, rowIdx)
+            exitPx  = array.get(histExitPx, rowIdx)
+            pnlUSD  = array.get(histPnlUSD, rowIdx)
+            result  = array.get(histResult, rowIdx)
+            rowColor = result == "STOP" ? color.new(color.red, 65) : pnlUSD > 0 ? color.new(color.green, 80) : color.new(color.red, 80)
+            table.cell(historyTable, 0, i + 1, str.tostring(rowIdx + 1),          bgcolor = rowColor, text_color = color.white)
+            table.cell(historyTable, 1, i + 1, dir,                              bgcolor = rowColor, text_color = color.white)
+            table.cell(historyTable, 2, i + 1, str.tostring(qty),                bgcolor = rowColor, text_color = color.white)
+            table.cell(historyTable, 3, i + 1, str.tostring(entryPx, format.mintick), bgcolor = rowColor, text_color = color.white)
+            table.cell(historyTable, 4, i + 1, str.tostring(exitPx, format.mintick),  bgcolor = rowColor, text_color = color.white)
+            table.cell(historyTable, 5, i + 1, (pnlUSD >= 0 ? "+$" : "-$") + str.tostring(math.abs(pnlUSD), "#.##") + (result == "STOP" ? " STOP" : ""), bgcolor = rowColor, text_color = color.white)
+        else
+            table.cell(historyTable, 0, i + 1, "", bgcolor = color.new(color.gray, 90), text_color = color.white)
+            table.cell(historyTable, 1, i + 1, "", bgcolor = color.new(color.gray, 90), text_color = color.white)
+            table.cell(historyTable, 2, i + 1, "", bgcolor = color.new(color.gray, 90), text_color = color.white)
+            table.cell(historyTable, 3, i + 1, "", bgcolor = color.new(color.gray, 90), text_color = color.white)
+            table.cell(historyTable, 4, i + 1, "", bgcolor = color.new(color.gray, 90), text_color = color.white)
+            table.cell(historyTable, 5, i + 1, "", bgcolor = color.new(color.gray, 90), text_color = color.white)
 
 // -----------------------------------------------------------------------------
 // ALERTS -- same four events as the companion indicator.
