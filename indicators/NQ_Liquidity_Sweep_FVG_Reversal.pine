@@ -324,8 +324,8 @@ if showHistory and barstate.islast
 // -----------------------------------------------------------------------------
 // PLOTS -- Buy / Sell signals only
 // -----------------------------------------------------------------------------
-plotshape(longEntrySignal,  title = "BUY",  text = "BUY",  style = shape.labelup,   location = location.belowbar, color = color.new(color.lime, 0), textcolor = color.black, size = size.small)
-plotshape(shortEntrySignal, title = "SELL", text = "SELL", style = shape.labeldown, location = location.abovebar, color = color.new(color.red, 0),  textcolor = color.white, size = size.small)
+plotshape(longEntrySignal,  title = "BUY",  text = "BUY",  style = shape.labelup,   location = location.belowbar, color = color.new(color.lime, 0), textcolor = color.black, size = size.small, display = display.pane)
+plotshape(shortEntrySignal, title = "SELL", text = "SELL", style = shape.labeldown, location = location.abovebar, color = color.new(color.red, 0),  textcolor = color.white, size = size.small, display = display.pane)
 
 // -----------------------------------------------------------------------------
 // ALERTS
