@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quant Academy — Learn JavaScript Through Day Trading</title>
+<meta name="description" content="A 100-day JavaScript curriculum, one 20–30 minute class per day, taught entirely through day-trading problems: candles, indicators, backtests and risk.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/css/styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📈</text></svg>">
+</head>
+<body>
+
+<header class="topbar">
+  <button class="icon-btn nav-toggle" id="navToggle" aria-label="Toggle lesson list">☰</button>
+  <a class="brand" href="#/" data-link>
+    <span class="brand-mark">◪</span>
+    <span class="brand-text">Quant<b>Academy</b></span>
+  </a>
+
+  <nav class="top-nav">
+    <a href="#/" data-link data-route="home">Dashboard</a>
+    <a href="#/map" data-link data-route="curriculum">The Path</a>
+    <a href="#/friends" data-link data-route="friends">Friends</a>
+    <a href="#/archive" data-link data-route="archive">Archive</a>
+    <a href="#/playground" data-link data-route="playground">Playground</a>
+    <a href="#/reference" data-link data-route="reference">Reference</a>
+  </nav>
+
+  <div class="top-stats">
+    <div class="stat" title="Consecutive days with a completed class">
+      <span class="stat-ico">🔥</span><span id="statStreak">0</span>
+    </div>
+    <div class="stat" title="Experience points earned">
+      <span class="stat-ico">✦</span><span id="statXp">0</span>
+    </div>
+    <div class="stat stat-progress" title="Classes completed">
+      <span id="statDone">0</span><span class="muted">&nbsp;cleared</span>
+    </div>
+    <button class="icon-btn" id="menuBtn" aria-label="Settings">⚙</button>
+  </div>
+</header>
+
+<div class="layout">
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-head">
+      <input type="search" id="lessonSearch" placeholder="Search 100 classes…" aria-label="Search classes">
+    </div>
+    <div class="sidebar-progress">
+      <div class="bar"><i id="sideBar"></i></div>
+      <small id="sideBarLabel">0% complete</small>
+    </div>
+    <nav class="lesson-nav" id="lessonNav"></nav>
+  </aside>
+
+  <main class="main" id="main"><div class="loading">Loading curriculum…</div></main>
+</div>
+
+<div class="modal-backdrop" id="modalBackdrop" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <h3 id="modalTitle">Settings</h3>
+    <div class="modal-body">
+      <p class="muted">Your progress is stored in this browser only — nothing is uploaded anywhere.</p>
+      <div class="setting-row">
+        <div><strong>Export progress</strong><br><small class="muted">Download a JSON backup.</small></div>
+        <button class="btn btn-ghost" id="exportBtn">Export</button>
+      </div>
+      <div class="setting-row">
+        <div><strong>Import progress</strong><br><small class="muted">Restore from a backup file.</small></div>
+        <label class="btn btn-ghost">Import<input type="file" id="importInput" accept="application/json" hidden></label>
+      </div>
+      <div class="setting-row">
+        <div><strong>Unlock all classes</strong><br><small class="muted">Skip ahead without finishing prior days.</small></div>
+        <label class="switch"><input type="checkbox" id="unlockAll"><span></span></label>
+      </div>
+      <div class="setting-row danger">
+        <div><strong>Reset everything</strong><br><small class="muted">Deletes all progress and saved code.</small></div>
+        <button class="btn btn-danger" id="resetBtn">Reset</button>
+      </div>
+    </div>
+    <div class="modal-foot"><button class="btn" id="modalClose">Done</button></div>
+  </div>
+</div>
+
+<div class="toast-wrap" id="toastWrap"></div>
+
+<script src="assets/js/market.js"></script>
+<script src="assets/js/game.js"></script>
+<script src="assets/js/social.js"></script>
+<script src="assets/js/runner.js"></script>
+<script src="assets/js/editor.js"></script>
+<script src="assets/js/curriculum/_helpers.js"></script>
+<script src="assets/js/curriculum/m1.js"></script>
+<script src="assets/js/curriculum/m2.js"></script>
+<script src="assets/js/curriculum/m3.js"></script>
+<script src="assets/js/curriculum/m4.js"></script>
+<script src="assets/js/curriculum/m5.js"></script>
+<script src="assets/js/curriculum/m6.js"></script>
+<script src="assets/js/curriculum/m7.js"></script>
+<script src="assets/js/app.js"></script>
+</body>
+</html>
