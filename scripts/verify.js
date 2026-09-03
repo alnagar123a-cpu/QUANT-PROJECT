@@ -26,7 +26,12 @@ const files = [
 const sandbox = {
   console, performance, setTimeout, clearTimeout, Promise, Math, JSON, Date,
   Number, String, Array, Object, Map, Set, Error, RegExp, Boolean, Symbol,
-  parseInt, parseFloat, isNaN, isFinite, TextEncoder, TextDecoder, structuredClone
+  parseInt, parseFloat, isNaN, isFinite, TextEncoder, TextDecoder, structuredClone,
+  // Browser globals the lessons legitimately use
+  URL, URLSearchParams, AggregateError, WeakMap, WeakSet, Proxy, Reflect,
+  Intl, BigInt, ArrayBuffer, DataView, Float64Array, Int32Array, Uint8Array,
+  queueMicrotask, setInterval, clearInterval, atob, btoa,
+  AbortController, AbortSignal, Event, EventTarget, Promise
 };
 sandbox.window = sandbox;
 sandbox.globalThis = sandbox;
@@ -40,6 +45,13 @@ for (const f of files) {
 
 const CUR = sandbox.CURRICULUM || [];
 const Runner = sandbox.Runner;
+
+// A stray unhandled rejection inside a lesson's own test should be reported,
+// not allowed to kill the whole verification run.
+const strayRejections = [];
+process.on('unhandledRejection', (reason) => {
+  strayRejections.push(reason && reason.message ? reason.message : String(reason));
+});
 
 let errors = [];
 let warnings = [];
@@ -126,8 +138,12 @@ for (const l of CUR) {
       } catch (e) { /* a starter that throws is fine */ }
 
       // par length sanity
+      // Boss solutions legitimately restate the starter scaffolding, so measure
+      // only the part the student actually has to write.
       const par = ex.solution.replace(/\s+/g, '').length;
-      if (par > 900) warn(where, `model solution is very long (${par} significant chars)`);
+      const scaffold = (ex.starter || '').replace(/\s+/g, '').length;
+      const written = Math.max(0, par - scaffold);
+      if (written > 900) warn(where, `model solution is very long (${written} chars beyond the starter)`);
     }
   }
 
@@ -149,6 +165,11 @@ for (const l of CUR) {
     console.log(`\n⚠ ${warnings.length} warning(s):`);
     warnings.slice(0, 40).forEach(w => console.log('  ' + w));
     if (warnings.length > 40) console.log(`  … and ${warnings.length - 40} more`);
+  }
+  if (strayRejections.length) {
+    console.log(`\n⚠ ${strayRejections.length} unhandled promise rejection(s) escaped a test:`);
+    [...new Set(strayRejections)].slice(0, 10).forEach(r => console.log('  ' + r));
+    console.log('  (a test created a rejected promise that nothing attached a handler to)');
   }
   if (errors.length) {
     console.log(`\n✕ ${errors.length} error(s):\n`);

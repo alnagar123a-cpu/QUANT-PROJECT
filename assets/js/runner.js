@@ -176,8 +176,9 @@
    * @param {string[]} expose  names to pull out of the student's scope
    * @returns {Promise<{logs, error, scope, ms}>}
    */
-  async function execute(code, expose) {
+  async function execute(code, expose, opts) {
     expose = expose || [];
+    opts = opts || {};
     var logs = [];
     var truncated = false;
 
@@ -218,6 +219,8 @@
       'volumes', 'positions', 'trades', 'specs'];
     var argVals = [sandboxConsole, __tick, global.MARKET, data.bars, data.closes, data.highs,
       data.lows, data.volumes, data.positions, data.trades, data.specs];
+    // Everything else (setTimeout, Promise, AbortController, URLSearchParams …)
+    // resolves through the normal scope chain to the host realm.
 
     var t0 = performance.now();
     var fn;
@@ -240,6 +243,15 @@
     } catch (e) {
       error = (e && e.stack ? String(e.name + ': ' + e.message) : String(e));
     }
+    // Give already-scheduled timers and microtasks a chance to run, so output
+    // produced from a setTimeout callback is captured rather than lost.
+    if (!error) {
+      var settle = opts.settleMs || 0;
+      for (var s = 0; s < 3; s++) {
+        await new Promise(function (r) { setTimeout(r, s === 0 ? settle : 0); });
+      }
+    }
+
     if (truncated) logs.push({ kind: 'mute', text: '… output truncated at ' + MAX_LOGS + ' lines' });
 
     return { logs: logs, error: error, scope: scope, ms: Math.round(performance.now() - t0) };
@@ -266,7 +278,7 @@
       });
     }
 
-    var run = await execute(code, expose);
+    var run = await execute(code, expose, { settleMs: spec.settleMs || 0 });
     var results = [];
 
     if (run.error) {
