@@ -478,8 +478,9 @@
       '</div>' +
 
       (level.boss ? '<div class="boss-banner"><span class="big">👑</span><div>' +
-        '<strong>Boss challenge.</strong> This level pulls together everything in the module. ' +
-        'No new theory — just build the thing.</div></div>' : '') +
+        '<strong>Boss challenge.</strong> This level pulls together everything before it — ' +
+        'no new theory, just build the thing. Budget a little longer than a normal class.' +
+        '</div></div>' : '') +
 
       '<div class="goal">' + level.goal + '</div>' +
 

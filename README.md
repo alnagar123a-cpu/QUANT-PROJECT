@@ -67,6 +67,10 @@ card. Export/import from the ⚙ menu.
 
 Every 10th level is a **boss challenge**: no new theory, just build the thing.
 
+**100 levels · 299 test-driven exercises · 300 quiz questions · 100 Parsons warm-ups
+· 10 boss challenges · 176 glossary terms.** Every model solution is verified against
+its own tests by `scripts/verify.js`.
+
 ## Running it
 
 It is a static site with no build step and no dependencies.
@@ -77,6 +81,10 @@ npx http-server -p 8080 .
 ```
 
 Opening `index.html` directly from disk also works.
+
+To publish it somewhere shareable, `npm run build` (or `node scripts/build.js`)
+inlines everything into a single `dist/quant-academy.html` with no external
+requests — drop that one file anywhere that serves HTML.
 
 ## Repository layout
 
@@ -92,6 +100,7 @@ assets/js/app.js                router and all views
 assets/js/curriculum/_helpers.js  shared test builders
 assets/js/curriculum/m1..m7.js    the 100 levels
 scripts/verify.js               curriculum QA
+scripts/build.js                bundles the site into one standalone HTML file
 ```
 
 ## Verifying the curriculum

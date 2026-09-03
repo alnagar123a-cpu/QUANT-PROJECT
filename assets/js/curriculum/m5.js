@@ -2184,7 +2184,7 @@
   });
 
   C.push({
-    id: 'd070', day: 70, module: 5, minutes: 40, boss: true,
+    id: 'd070', day: 70, module: 5, minutes: 35, boss: true,
     title: 'Boss: The Filtered Signal System',
     subtitle: 'Momentum, trend, volatility and session — the full indicator stack.',
     goal: '<b>Goal:</b> reproduce the complete signal logic of the Pine indicator shipped in this repository, in JavaScript.',

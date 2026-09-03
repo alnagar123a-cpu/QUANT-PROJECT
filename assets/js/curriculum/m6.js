@@ -1425,7 +1425,7 @@
 
 
   C.push({
-    id: 'd080', day: 80, module: 6, minutes: 40, boss: true,
+    id: 'd080', day: 80, module: 6, minutes: 35, boss: true,
     title: 'Boss: The Backtester',
     subtitle: 'Bar loop, sizing, costs, equity and statistics in one engine.',
     goal: '<b>Goal:</b> build the complete backtester — the thing every previous level in this module was a piece of.',
