@@ -1222,13 +1222,35 @@
       Game.state.settings.unlockAll = e.target.checked;
       Game.save(); renderSidebar(active && active.level.day); route();
     });
-    $('#exportBtn').addEventListener('click', function () {
-      var blob = new Blob([Game.exportJSON()], { type: 'application/json' });
+    $('#exportBtn').addEventListener('click', async function () {
+      var json = Game.exportJSON();
+      var filename = 'quant-academy-progress.json';
+
+      // Where the page is hosted inside a viewer that mediates file saves,
+      // a plain <a download> is inert — ask the host to save it instead.
+      var downloads = null;
+      if (window.claude && typeof window.claude.use === 'function') {
+        try { downloads = await window.claude.use('downloads'); } catch (e) { downloads = null; }
+      }
+      if (downloads) {
+        try {
+          await downloads.save({ filename: filename, data: json });
+          toast('Progress exported.', 'good');
+        } catch (err) {
+          if (err && err.code === 'declined') toast('Export cancelled.', '');
+          else toast('Could not export: ' + esc((err && err.message) || 'unavailable'), 'bad');
+        }
+        return;
+      }
+
+      // Ordinary web host: the browser download works.
+      var blob = new Blob([json], { type: 'application/json' });
       var a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
-      a.download = 'quant-academy-progress.json';
+      a.download = filename;
       a.click();
       setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
+      toast('Progress exported.', 'good');
     });
     $('#importInput').addEventListener('change', function (e) {
       var f = e.target.files[0]; if (!f) return;
